@@ -2,7 +2,7 @@ import numpy as np
 
 
 class Missile:
-    def __init__(self, x, y, v, head):
+    def __init__(self, x=0.0, y=0.0, v=0.0, head=0.0):
         self.x = x
         self.y = y
         self.v = v

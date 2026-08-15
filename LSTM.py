@@ -5,6 +5,7 @@ from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from sim import Sim
+import joblib
 from vehicle import Vehicle
 
 N_SIMS = 1000
@@ -94,6 +95,10 @@ x_test_scaled = x_scaler.transform(x_test.reshape(-1, 4)).reshape(x_test.shape)
 y_test_scaled = y_scaler.transform(y_test.reshape(-1, 2)).reshape(y_test.shape)
 
 
+joblib.dump(x_scaler, "x_scaler.pkl")
+joblib.dump(y_scaler, "y_scaler.pkl")
+
+
 ## tensor화
 x_train = torch.tensor(x_train_scaled, dtype=torch.float32)
 y_train = torch.tensor(y_train_scaled, dtype=torch.float32)
@@ -160,6 +165,7 @@ class LSTMModel(nn.Module):
 
 
 model = LSTMModel(input_size, hidden_size, num_layers, output_size)
+model.load_state_dict(torch.load("lstm_model.pth", map_location=torch.device("cpu")))
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 

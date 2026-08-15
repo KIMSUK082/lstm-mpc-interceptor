@@ -47,7 +47,7 @@ class Vehicle:
             self.max_bank,
         )
 
-    ##(선택)  수정 필요 현재 구조는 bank 각도가 점진적으로 변하지 않고 이산적으로 변함
+    ##(선택) 수정 필요 현재 구조는 bank 각도가 점진적으로 변하지 않고 이산적으로 변함
 
     def set_bank_cmd(self, bank_cmd):
         self.bank_cmd = np.clip(bank_cmd, self.min_bank, self.max_bank)
@@ -80,4 +80,9 @@ class Vehicle:
                 self.head,
                 self.bank,
             ]
+        )
+
+    def get_pos_vel(self):
+        return np.array(
+            [self.x, self.y, self.v * np.cos(self.head), self.v * np.sin(self.head)]
         )
