@@ -95,7 +95,7 @@ $$
 
 $$
 \theta_c =
-\operatorname{atan2}
+\mathrm{atan2}
 \left(
 v_{y,c},
 v_{x,c}
@@ -242,8 +242,8 @@ $$
 $$
 B_k=
 \begin{bmatrix}
--\Delta t^2\sin\theta_k \\
-\Delta t^2\cos\theta_k \\
+-\Delta t^{2}\sin\theta_k \\
+\Delta t^{2}\cos\theta_k \\
 \Delta t/v
 \end{bmatrix}
 $$
@@ -265,7 +265,7 @@ $$
 \bar U=
 \begin{bmatrix}
 0&0&\cdots&0
-\end{bmatrix}^T
+\end{bmatrix}^{T}
 $$
 
 이후 계산에서는 직전 QP 해를 한 칸 이동하여 다음 선형화의 기준 입력으로 사용한다.
@@ -273,8 +273,8 @@ $$
 $$
 \bar U=
 \begin{bmatrix}
-u_1^*&u_2^*&\cdots&u_{N-1}^*&u_{N-1}^*
-\end{bmatrix}^T
+u_1^{*}&u_2^{*}&\cdots&u_{N-1}^{*}&u_{N-1}^{*}
+\end{bmatrix}^{T}
 $$
 
 기준 입력을 비선형 운동모델에 적용하여 기준 상태 궤적을 구하고, 각 예측 지점에서 $A_k$, $B_k$, $d_k$를 계산한다.
@@ -320,7 +320,7 @@ $$
 
 $$
 \bar Q =
-\operatorname{blkdiag}
+\mathrm{blkdiag}
 \left(
 Q,\ldots,Q,Q_N
 \right)
@@ -342,18 +342,18 @@ J(U)
 =&
 \frac{1}{2}
 \sum_{k=1}^{N-1}
-(\mathbf{x}_k-\mathbf{r}_k)^T
+(\mathbf{x}_k-\mathbf{r}_k)^{T}
 Q
 (\mathbf{x}_k-\mathbf{r}_k) \\
 &+
 \frac{1}{2}
-(\mathbf{x}_N-\mathbf{r}_N)^T
+(\mathbf{x}_N-\mathbf{r}_N)^{T}
 Q_N
 (\mathbf{x}_N-\mathbf{r}_N) \\
 &+
 \frac{1}{2}
 \sum_{k=0}^{N-1}
-u_k^TRu_k.
+u_k^{T}Ru_k.
 \end{aligned}
 $$
 
@@ -362,11 +362,11 @@ $$
 $$
 J(U) =
 \frac{1}{2}
-(\mathbf{X}-\mathbf{X}_{\mathrm{ref}})^T
+(\mathbf{X}-\mathbf{X}_{\mathrm{ref}})^{T}
 \bar Q
 (\mathbf{X}-\mathbf{X}_{\mathrm{ref}})
 +
-\frac{1}{2}U^T\bar R U
+\frac{1}{2}U^{T}\bar R U
 $$
 
 ### 3.6 QP 변환
@@ -390,7 +390,7 @@ $$
 $$
 \boxed{
 \min_U
-\frac{1}{2}U^TPU+q^TU
+\frac{1}{2}U^{T}PU+q^{T}U
 }
 $$
 
@@ -398,13 +398,13 @@ $$
 
 $$
 \boxed{
-P=S^T\bar Q S+\bar R
+P=S^{T}\bar Q S+\bar R
 }
 $$
 
 $$
 \boxed{
-q=S^T\bar Q
+q=S^{T}\bar Q
 \left(
 T\mathbf{x}_0+t-\mathbf{X}_{\mathrm{ref}}
 \right)
@@ -440,16 +440,16 @@ U = solve_qp(
 QP로 계산한 최적 제어입력 시퀀스는 다음과 같다.
 
 $$
-U^*=
+U^{*}=
 \begin{bmatrix}
-u_0^*&u_1^*&\cdots&u_{N-1}^*
-\end{bmatrix}^T
+u_0^{*}&u_1^{*}&\cdots&u_{N-1}^{*}
+\end{bmatrix}^{T}
 $$
 
 실제 요격체에는 첫 번째 입력만 적용한다.
 
 $$
-u_{\mathrm{applied}}=u_0^*
+u_{\mathrm{applied}}=u_0^{*}
 $$
 
 다음 제어주기에는 갱신된 미사일 상태와 새로운 LSTM 예측으로 같은 최적화 문제를 다시 계산한다.
@@ -480,5 +480,3 @@ $$
 ## 5. 문제점
 
 물체가 복잡하게 움직였을때 요격을 실패하거나 아니면 거친 원운동을 하여 요격을 하는 경우가 있음
-
-
