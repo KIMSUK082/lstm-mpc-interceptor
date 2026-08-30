@@ -57,8 +57,7 @@ $$
 Weave 기동의 뱅크각 명령은 다음과 같다.
 
 $$
-\phi_{\mathrm{cmd}}(t)
-=
+\phi_{\mathrm{cmd}}(t) =
 \phi_{\max}
 \sin
 \left(
@@ -95,8 +94,7 @@ $$
 마지막 관측 시점의 위치와 속도를 각각 $\mathbf{p}_c$, $\mathbf{v}_c$라고 하면 현재 방향각은 다음과 같다.
 
 $$
-\theta_c
-=
+\theta_c =
 \operatorname{atan2}
 \left(
 v_{y,c},
@@ -216,8 +214,7 @@ $$
 
 $$
 \boxed{
-\mathbf{x}_{k+1}
-=
+\mathbf{x}_{k+1} =
 A_k\mathbf{x}_k+B_ku_k+d_k
 }
 $$
@@ -225,8 +222,7 @@ $$
 기준점에서의 다음 방향각을 다음과 같이 정의한다.
 
 $$
-\theta_k
-=
+\theta_k =
 \bar{\psi}_k
 +
 \frac{\bar{u}_k}{v}\Delta t
@@ -252,11 +248,10 @@ B_k=
 \end{bmatrix}
 $$
 
-위에 선형화 식을 정리하면 $$d_k$$는 다음과 같다
+위에 선형화 식을 정리하면 $d_k$는 다음과 같다
 
 $$
-d_k
-=
+d_k =
 f(\bar{\mathbf{x}}_k,\bar{u}_k)
 -A_k\bar{\mathbf{x}}_k
 -B_k\bar{u}_k
@@ -324,8 +319,7 @@ $$
 전체 가중행렬은 다음과 같다.
 
 $$
-\bar Q
-=
+\bar Q =
 \operatorname{blkdiag}
 \left(
 Q,\ldots,Q,Q_N
@@ -333,8 +327,7 @@ Q,\ldots,Q,Q_N
 $$
 
 $$
-\bar R
-=
+\bar R =
 I_N\otimes R
 $$
 
@@ -367,8 +360,7 @@ $$
 이를 쌓은 행렬로 표현하면 다음과 같다.
 
 $$
-J(U)
-=
+J(U) =
 \frac{1}{2}
 (\mathbf{X}-\mathbf{X}_{\mathrm{ref}})^T
 \bar Q
@@ -382,8 +374,7 @@ $$
 상태예측식 $\mathbf{X}=SU+T\mathbf{x}_0+t$를 비용함수에 대입한다. 다음 오차 벡터를 정의하면:
 
 $$
-e
-=
+e =
 T\mathbf{x}_0+t-\mathbf{X}_{\mathrm{ref}}
 $$
 
@@ -489,3 +480,5 @@ $$
 ## 5. 문제점
 
 물체가 복잡하게 움직였을때 요격을 실패하거나 아니면 거친 원운동을 하여 요격을 하는 경우가 있음
+
+
