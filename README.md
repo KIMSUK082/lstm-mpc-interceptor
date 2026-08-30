@@ -262,19 +262,13 @@ $$
 첫 MPC 계산에서는 선형화의 기준입력 기준 입력 $\bar{u}_k$을 0으로 정의한다
 
 $$
-\bar U=
-\begin{bmatrix}
-0&0&\cdots&0
-\end{bmatrix}^{T}
+\bar U = \left[0,\ 0,\ \ldots,\ 0\right]^{T}
 $$
 
 이후 계산에서는 직전 QP 해를 한 칸 이동하여 다음 선형화의 기준 입력으로 사용한다.
 
 $$
-\bar U=
-\begin{bmatrix}
-u_1^{*}&u_2^{*}&\cdots&u_{N-1}^{*}&u_{N-1}^{*}
-\end{bmatrix}^{T}
+\bar U = \left[u_{1,\mathrm{opt}},\ u_{2,\mathrm{opt}},\ \ldots,\ u_{N-1,\mathrm{opt}},\ u_{N-1,\mathrm{opt}}\right]^{T}
 $$
 
 기준 입력을 비선형 운동모델에 적용하여 기준 상태 궤적을 구하고, 각 예측 지점에서 $A_k$, $B_k$, $d_k$를 계산한다.
@@ -440,16 +434,13 @@ U = solve_qp(
 QP로 계산한 최적 제어입력 시퀀스는 다음과 같다.
 
 $$
-U^{*}=
-\begin{bmatrix}
-u_0^{*}&u_1^{*}&\cdots&u_{N-1}^{*}
-\end{bmatrix}^{T}
+U_{\mathrm{opt}} = \left[u_{0,\mathrm{opt}},\ u_{1,\mathrm{opt}},\ \ldots,\ u_{N-1,\mathrm{opt}}\right]^{T}
 $$
 
 실제 요격체에는 첫 번째 입력만 적용한다.
 
 $$
-u_{\mathrm{applied}}=u_0^{*}
+u_{\mathrm{applied}} = u_{0,\mathrm{opt}}
 $$
 
 다음 제어주기에는 갱신된 미사일 상태와 새로운 LSTM 예측으로 같은 최적화 문제를 다시 계산한다.
