@@ -1,675 +1,491 @@
-# 2D LSTM–MPC 이동표적 요격 시뮬레이터
+# LSTM-MPC 표적 요격 시뮬레이터
 
-2차원 평면에서 항공기 형태의 기동표적 궤적을 생성하고, LSTM으로 표적의 미래 위치를 예측하여
-그 예측을 MPC의 기준궤적으로 사용해 요격하는 것을 목표로 한다.
+표적 항공기의 과거 2초 궤적을 LSTM에 입력하여 미래 위치를 예측하고, 예측된 표적 위치를 기준 궤적으로 사용하는 MPC를 통해 요격체의 횡가속도를 결정하는 2차원 시뮬레이터이다.
 
-참고문헌: Nonlinear Model Based Guidance with Deep Learning (NMPC-TAP), arXiv:2104.02491
-— 참고용이며 본 구현이 논문을 그대로 따르지는 않는다. 특히 **본 프로젝트의 LSTM은 가속도가 아니라
-표적의 미래 위치를 예측**한다 (자세한 이유는 §6.1, §9.6).
+## 1. 표적 항공기 운동
 
----
+### 1.1 상태 정의
 
-## 0. 현재 구현 상태
+표적 항공기의 상태는 다음과 같이 정의하였다.
 
-| 항목 | 상태 | 파일 |
-|---|---|---|
-| 표적 운동모델 (2D 협조선회) | ✅ 완료 | `vehicle.py` |
-| 기동 생성기 (straight / turn / weave) | ✅ 완료 | `sim.py` |
-| 궤적 시각화 | ✅ 완료 | `sim.py` |
-| 데이터셋 생성기 | ✅ 완료 | `sim.py` (`dataset_sim`) |
-| LSTM 예측기 | ✅ 완료 | `model.py`, `LSTM.py` |
-| 미사일 운동모델 | ⚠️ 클래스만 존재 (시뮬 루프에서 `step()` 미호출 → 정지 상태) | `missile.py` |
-| 유도법칙 (PN) | ❌ 미구현 | — |
-| MPC | ❌ 미구현 | — |
+$$
+\mathbf{x}_{\mathrm{vehicle},k} =
+\begin{bmatrix}
+p_{x,k} \\
+p_{y,k} \\
+v_k \\
+\psi_k \\
+\phi_k
+\end{bmatrix}
+$$
 
-> `refer.py`는 별도의 참고 구현이다. 본 파이프라인에서 쓰지 않으며,
-> 검증 테스트와 파라미터 근거 확인용으로만 둔다.
+표적은 외부에서 뱅크각 명령 $\phi_{\mathrm{cmd}}$를 받는다. 표적은 뱅크각 명령에따라 각각 다른 움직임을 만들어 낸다.
 
-**학습 산출물** (`LSTM.py` 실행 시 생성, 저장소에 포함)
+### 1.2 방향각과 위치 갱신
 
-```
-lstm_model.pth      학습된 LSTM 가중치
-x_scaler.pkl        입력 정규화 스케일러 (학습 데이터로 fit)
-y_scaler.pkl        출력 정규화 스케일러
-```
+뱅크각이 변하면 표적의 횡가속도가 변한다. 횡가속도는 진행방향 각속도를 만들고, 갱신된 진행방향에 따라 표적의 위치가 변한다.
 
-`sim.py`의 예측 기능은 이 세 파일이 있어야 동작한다.
+$$
+\begin{aligned}
+a_{\mathrm{lat},k}
+&= g\tan\phi_k, \\
+\dot{\psi}_k
+&= \frac{a_{\mathrm{lat},k}}{v_k}, \\
+\psi_{k+1}
+&= \psi_k+\dot{\psi}_k\Delta t, \\
+v_{x,k+1}
+&= v_{k+1}\cos\psi_{k+1}, \\
+v_{y,k+1}
+&= v_{k+1}\sin\psi_{k+1}, \\
+p_{x,k+1}
+&= p_{x,k}+v_{k+1}\cos\psi_{k+1}\Delta t, \\
+p_{y,k+1}
+&= p_{y,k}+v_{k+1}\sin\psi_{k+1}\Delta t.
+\end{aligned}
+$$
 
-**실행**
+표적이 선회할 때 발생하는 속도 감소와 추력에 의한 속도 회복은 시뮬레이션 편의를 위한 단순 모델로만 구현하였다.
 
-```bash
-python main.py
-```
+### 1.3 표적 기동 종류
 
----
+학습 데이터와 요격 시뮬레이션에서는 자연스러운 표적의 움직임을 위해 다음 3가지 기동중 무작위로 하나의 기동이 선택되어 랜덤한 시간동안 한모드의 기동이 작동한다.
 
-## 1. 모델링 가정
+- `straight`
+- `turn`
+- `weave`
 
-현재 `Vehicle`은 6자유도 모델이 아니다. 고도를 일정하게 유지한다고 가정하고
-수평면에서의 위치·속력·진행방향·뱅크각만 계산하는 **2D coordinated-turn(협조선회) 모델**이다.
+Weave 기동의 뱅크각 명령은 다음과 같다.
 
-- 표적은 고도가 일정한 2차원 평면에서 움직인다.
-- 옆미끄럼(sideslip)이 없는 협조선회를 한다.
-- 뱅크 중에도 양력의 수직성분이 중력과 평형을 이루어 고도가 유지된다.
-- 뱅크각 지령은 **최대 롤레이트 제한**을 거쳐 실제 뱅크각에 반영된다.
-- 선회 시 증가하는 **유도항력** 때문에 속도가 감소한다.
-- 오토스로틀이 감소한 속도를 기준속도까지 회복시키려 한다.
-- 기본 순항추력과 형상항력은 서로 상쇄된 것으로 보고,
-  **선회로 인해 추가로 발생한 유도항력만** 속도식에 포함한다.
-- 실속, 받음각, 고도 변화, 바람, 엔진 응답지연, 형상항력, 6자유도 자세운동은 모델링하지 않는다.
+$$
+\phi_{\mathrm{cmd}}(t)
+=
+\phi_{\max}
+\sin
+\left(
+\frac{2\pi}{T_{\mathrm{weave}}}(t-t_0)
+\right)
+$$
 
----
+## 2. LSTM 구현과 데이터 전처리
 
-## 2. 상태와 입력
+### 2.1 데이터 구성
 
-**상태벡터** (`Vehicle.get_state()` 반환값 순서와 동일)
+표적 기동 시뮬레이션을 반복하여 LSTM 학습 데이터를 생성하였다.
 
-```
-x = [ x, y, v, psi, phi ]^T
-```
+LSTM 입력은 과거 40개 상태이다.
 
-| 기호 | 코드 변수 | 의미 | 단위 |
-|---|---|---|---|
-| `x` | `self.x` | X축 위치 | m |
-| `y` | `self.y` | Y축 위치 | m |
-| `v` | `self.v` | 진행방향 속력 | m/s |
-| `psi` | `self.head` | 진행방향각 (heading) | rad |
-| `phi` | `self.bank` | 뱅크각 | rad |
+$$
+\mathbf{X}_{\mathrm{LSTM}}
+\in
+\mathbb{R}^{40\times4}
+$$
 
-**제어입력**
+출력은 미래 20개 상대 위치이다.
 
-```
-u = phi_cmd        (목표 뱅크각, rad)
-```
+$$
+\mathbf{Y}_{\mathrm{LSTM}}
+\in
+\mathbb{R}^{20\times2}
+$$
 
-입력이 **뱅크각 하나뿐**인 것이 이 모델의 핵심 설계다.
-횡가속도를 직접 지정하지 않는 이유는 §3.2 참고.
+### 2.2 상대좌표 변환
 
----
+절대좌표를 그대로 학습하면 모델이 표적의 실제 운동보다 특정 위치 범위를 학습할 가능성이 있다. 이를 줄이기 위해 마지막 관측 시점의 표적 위치를 원점으로 하고 현재 진행방향을 X축으로 하는 상대좌표를 사용하였다.
 
-## 3. 운동방정식
+마지막 관측 시점의 위치와 속도를 각각 $\mathbf{p}_c$, $\mathbf{v}_c$라고 하면 현재 방향각은 다음과 같다.
 
-### 3.1 롤 채널 — 뱅크각 응답
+$$
+\theta_c
+=
+\operatorname{atan2}
+\left(
+v_{y,c},
+v_{x,c}
+\right)
+$$
 
-비행기는 횡가속도를 직접 만들 수 없다. 반드시 롤을 해서 뱅크각을 만들어야
-양력이 기울고 그 수평성분이 구심력이 된다. 그리고 **롤에는 시간이 걸린다.**
+전역좌표를 표적 진행방향 기준 좌표로 회전하는 행렬은 다음과 같다.
 
-지령은 먼저 기체 한계로 포화된다.
+$$
+R=
+\begin{bmatrix}
+\cos\theta_c & \sin\theta_c \\
+-\sin\theta_c & \cos\theta_c
+\end{bmatrix}
+$$
 
-$$\phi_{cmd} \leftarrow \mathrm{clip}(\phi_{cmd},\; -\phi_{max},\; \phi_{max})$$
+과거 위치와 속도는 다음과 같이 상대좌표로 변환한다.
 
-실제 뱅크각은 롤레이트 제한을 받으며 지령을 따라간다.
+$$
+\begin{aligned}
+\mathbf{p}_{\mathrm{rel},i}
+&=R(\mathbf{p}_i-\mathbf{p}_c), \\
+\mathbf{v}_{\mathrm{rel},i}
+&=R\mathbf{v}_i.
+\end{aligned}
+$$
 
-$$\Delta\phi = \mathrm{clip}\big(\phi_{cmd}-\phi,\; -p_{max}\Delta t,\; +p_{max}\Delta t\big)$$
-$$\phi \leftarrow \mathrm{clip}(\phi + \Delta\phi,\; -\phi_{max},\; \phi_{max})$$
+따라서 LSTM의 입력은 다음과 같다.
+
+$$
+\mathbf{z}_i=
+\begin{bmatrix}
+p_{x,\mathrm{rel},i} \\
+p_{y,\mathrm{rel},i} \\
+v_{x,\mathrm{rel},i} \\
+v_{y,\mathrm{rel},i}
+\end{bmatrix}
+$$
+
+미래 정답 위치도 같은 원점과 회전행렬을 사용한다.
+
+### 2.3 정규화와 데이터 분할
+
+입력과 출력에는 서로 다른 `MinMaxScaler`를 적용하여 각 값을 $[-1,1]$ 범위로 정규화하였다.
+데이터를 `train`, `validation`,`test` 각각 80:10:10을 데이터를 분할하였다.
+
+### 2.4 학습 및 평가
+
+데이터 학습 따로 ipynb 파일을 만들어 구글 코랩에서 진행하였다
+밑에 그래프는 train-validation 차이와 lstm이 예측한 경로와 실제경로의 오차를 그래프로 나타내었다
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/images/train-validation-loss.png" width="100%">
+    </td>
+    <td width="50%">
+      <img src="docs/images/test-trajectory-prediction.png" width="100%">
+    </td>
+  </tr>
+</table>
+
+과적합 없이 훈련이 잘된 것을 알수있다.
+
+## 3. MPC 요격 제어
+
+### 3.1 요격체 운동모델
+
+MPC에서 사용하는 요격체 상태와 제어입력은 다음과 같다.
+
+$$
+\mathbf{x}_k=
+\begin{bmatrix}
+p_{x,k} \\
+p_{y,k} \\
+\psi_k
+\end{bmatrix},
+\qquad
+u_k=a_{\mathrm{lat},k}
+$$
+
+요격체 속력 $v$는 일정하다고 가정하였을때 이산 비선형 운동모델은 다음과 같다.
+
+$$
+\begin{aligned}
+\psi_{k+1}
+&=\psi_k+\frac{u_k}{v}\Delta t, \\
+p_{x,k+1}
+&=p_{x,k}+v\cos\psi_{k+1}\Delta t, \\
+p_{y,k+1}
+&=p_{y,k}+v\sin\psi_{k+1}\Delta t.
+\end{aligned}
+$$
+
+따라서 상태방정식은 다음과 같다.
+
+$$
+\mathbf{x}_{k+1}=f(\mathbf{x}_k,u_k)
+$$
+
+### 3.2 운동모델 선형화
+
+운동모델에는 $\sin$과 $\cos$이 포함되어 있으므로 기준 상태 $\bar{\mathbf{x}}_k$와 기준 입력 $\bar{u}_k$ 주변에서 매 스텝 선형화한다.
+
+1차 Taylor 전개는 다음과 같다.
+
+$$
+f(\mathbf{x}_k,u_k)
+\approx
+f(\bar{\mathbf{x}}_k,\bar{u}_k)
++A_k(\mathbf{x}_k-\bar{\mathbf{x}}_k)
++B_k(u_k-\bar{u}_k)
+$$
+
+이를 정리하면 다음과 같은 식을 얻을 수 있다.
+
+$$
+\boxed{
+\mathbf{x}_{k+1}
+=
+A_k\mathbf{x}_k+B_ku_k+d_k
+}
+$$
+
+기준점에서의 다음 방향각을 다음과 같이 정의한다.
+
+$$
+\theta_k
+=
+\bar{\psi}_k
++
+\frac{\bar{u}_k}{v}\Delta t
+$$
+
+Jacobian 행렬은 다음과 같다.
+
+$$
+A_k=
+\begin{bmatrix}
+1 & 0 & -v\Delta t\sin\theta_k \\
+0 & 1 & v\Delta t\cos\theta_k \\
+0 & 0 & 1
+\end{bmatrix}
+$$
+
+$$
+B_k=
+\begin{bmatrix}
+-\Delta t^2\sin\theta_k \\
+\Delta t^2\cos\theta_k \\
+\Delta t/v
+\end{bmatrix}
+$$
+
+위에 선형화 식을 정리하면 $$d_k$$는 다음과 같다
+
+$$
+d_k
+=
+f(\bar{\mathbf{x}}_k,\bar{u}_k)
+-A_k\bar{\mathbf{x}}_k
+-B_k\bar{u}_k
+$$
+
+### 3.3 기준 궤적과 예측행렬
+
+첫 MPC 계산에서는 선형화의 기준입력 기준 입력 $\bar{u}_k$을 0으로 정의한다
+
+$$
+\bar U=
+\begin{bmatrix}
+0&0&\cdots&0
+\end{bmatrix}^T
+$$
+
+이후 계산에서는 직전 QP 해를 한 칸 이동하여 다음 선형화의 기준 입력으로 사용한다.
+
+$$
+\bar U=
+\begin{bmatrix}
+u_1^*&u_2^*&\cdots&u_{N-1}^*&u_{N-1}^*
+\end{bmatrix}^T
+$$
+
+기준 입력을 비선형 운동모델에 적용하여 기준 상태 궤적을 구하고, 각 예측 지점에서 $A_k$, $B_k$, $d_k$를 계산한다.
+
+미래 상태를 하나의 벡터로 쌓으면 다음과 같다.
+
+$$
+\mathbf{X}=
+\begin{bmatrix}
+\mathbf{x}_1 \\
+\mathbf{x}_2 \\
+\vdots \\
+\mathbf{x}_N
+\end{bmatrix}
+$$
+
+각 시점의 선형모델을 반복하여 대입하면 미래 상태를 다음과 같이 나타낼 수 있다.
+
+$$
+\boxed{
+\mathbf{X}=SU+T\mathbf{x}_0+t
+}
+$$
+
+### 3.4 기준 궤적과 가중행렬
+
+LSTM이 예측한 미래 절대 위치 20개를 MPC 기준 궤적으로 사용한다.
+
+$$
+\mathbf{X}_{\mathrm{ref}}=
+\begin{bmatrix}
+p_{x,1}^{\mathrm{target}} \\
+p_{y,1}^{\mathrm{target}} \\
+0 \\
+\vdots \\
+p_{x,N}^{\mathrm{target}} \\
+p_{y,N}^{\mathrm{target}} \\
+0
+\end{bmatrix}
+$$
+
+전체 가중행렬은 다음과 같다.
+
+$$
+\bar Q
+=
+\operatorname{blkdiag}
+\left(
+Q,\ldots,Q,Q_N
+\right)
+$$
+
+$$
+\bar R
+=
+I_N\otimes R
+$$
+
+### 3.5 비용함수
+
+MPC 비용함수는 미래 위치 오차와 제어입력 크기의 가중합으로 정의한다.
+중간 비용함수의 가중치를 Q=(1,1,0)로 정의하였고 qn=(20,20,0)으로 정의하여 유도를 정확히 하기 위해서 중간 비용 가중치보다 크게 정의하였다.
+
+$$
+\begin{aligned}
+J(U)
+=&
+\frac{1}{2}
+\sum_{k=1}^{N-1}
+(\mathbf{x}_k-\mathbf{r}_k)^T
+Q
+(\mathbf{x}_k-\mathbf{r}_k) \\
+&+
+\frac{1}{2}
+(\mathbf{x}_N-\mathbf{r}_N)^T
+Q_N
+(\mathbf{x}_N-\mathbf{r}_N) \\
+&+
+\frac{1}{2}
+\sum_{k=0}^{N-1}
+u_k^TRu_k.
+\end{aligned}
+$$
+
+이를 쌓은 행렬로 표현하면 다음과 같다.
+
+$$
+J(U)
+=
+\frac{1}{2}
+(\mathbf{X}-\mathbf{X}_{\mathrm{ref}})^T
+\bar Q
+(\mathbf{X}-\mathbf{X}_{\mathrm{ref}})
++
+\frac{1}{2}U^T\bar R U
+$$
+
+### 3.6 QP 변환
+
+상태예측식 $\mathbf{X}=SU+T\mathbf{x}_0+t$를 비용함수에 대입한다. 다음 오차 벡터를 정의하면:
+
+$$
+e
+=
+T\mathbf{x}_0+t-\mathbf{X}_{\mathrm{ref}}
+$$
+
+미래 상태 오차는 다음과 같다.
+
+$$
+\mathbf{X}-\mathbf{X}_{\mathrm{ref}}
+=SU+e
+$$
+
+비용함수를 전개하여 제어입력 $U$와 무관한 상수항을 제거하면 다음 표준 QP 형태를 얻는다.
+
+$$
+\boxed{
+\min_U
+\frac{1}{2}U^TPU+q^TU
+}
+$$
+
+여기서 QP 행렬은 다음과 같다.
+
+$$
+\boxed{
+P=S^T\bar Q S+\bar R
+}
+$$
+
+$$
+\boxed{
+q=S^T\bar Q
+\left(
+T\mathbf{x}_0+t-\mathbf{X}_{\mathrm{ref}}
+\right)
+}
+$$
+
+요격체 최대 횡가속도는 다음 제약조건으로 적용한다.
+
+$$
+-u_{\max}\mathbf{1}
+\le U\le
+u_{\max}\mathbf{1}
+$$
+
+$$
+u_{\max}=g_{\max}\times9.81
+$$
+
+QP는 `qpsolvers`의 `quadprog` solver를 사용하여 계산한다.
 
 ```python
-# vehicle.py : update_bank()
-bank_error      = self.bank_cmd - self.bank
-max_bank_change = self.max_roll_rate * dt
-bank_change     = np.clip(bank_error, -max_bank_change, max_bank_change)
-self.bank      += bank_change
-self.bank       = np.clip(self.bank, self.min_bank, self.max_bank)
+U = solve_qp(
+    P,
+    q,
+    lb=u_min,
+    ub=u_max,
+    solver="quadprog",
+)
 ```
 
-이것은 **순수 레이트 리미터**다. 1차 지연(first-order lag)은 아직 넣지 않았다.
-따라서 뱅크각 시계열은 연속이지만 기울기가 꺾이는 사다리꼴 형태이고,
-롤레이트는 `0 → p_max → 0`으로 계단처럼 변한다. 궤적 품질에는 실질적 영향이 없다.
-
-### 3.2 협조선회 — 뱅크각에서 횡가속도로
-
-수평 등속선회의 힘 평형:
-
-$$L\cos\phi = mg \quad (\text{수직}), \qquad L\sin\phi = m\,a_{lat} \quad (\text{수평})$$
-
-두 식을 나누면
-
-$$\boxed{\;a_{lat} = g\tan\phi\;}, \qquad n \equiv \frac{L}{mg} = \frac{1}{\cos\phi}, \qquad a_{lat} = g\sqrt{n^2-1}$$
-
-여기서 `n`은 하중배수(load factor, "몇 g"). 진행방향각의 변화율은
-
-$$\boxed{\;\dot\psi = \frac{a_{lat}}{v} = \frac{g\tan\phi}{v}\;}$$
-
-```python
-# vehicle.py : step()
-self.alat      = self.g * np.tan(self.bank)
-self.head_rate = self.alat / np.clip(self.v, self.min_speed, self.max_speed)
-self.head     += self.head_rate * dt
-```
-
-> `np.clip`은 0 나눗셈 방어용이다. `self.v`가 이미 같은 범위로 포화되어 있어 실질적으로 중복이지만
-> 안전장치로 남겨두었다.
-
-**`tan`은 강한 비선형**이므로 각도로 감을 잡으면 안 된다. 반드시 `n`으로 생각할 것.
-
-| 뱅크각 | `n` [g] | `a_lat` [m/s²] |
-|---|---|---|
-| 30° | 1.15 | 5.7 |
-| 50° | 1.56 | 11.7 |
-| 60° | 2.00 | 17.0 |
-| 70° | 2.92 | 27.0 |
-| 75° | 3.86 | 36.6 |
-| 80° | 5.76 | 55.6 |
-| 82° | 7.19 | 69.8 |
-
-> **왜 90°가 아닌 82°가 상한인가**: `phi = 90°`면 `cos 90° = 0`이라 `L cos(phi) = mg`를 만족할 수 없다
-> (`n → ∞`). 실제 항공기가 90° 뱅크를 못 하는 게 아니라, **우리가 수평비행을 가정했기 때문**에
-> 생기는 한계다. 82°는 `n = 7.19g`에 해당하며 유인기 구조한계(통상 9g)를 고려한 값이다.
-
-### 3.3 속도 — 유도항력과 오토스로틀
-
-유도항력은 양력의 제곱에 비례한다.
-
-$$D_i = \frac{C_L^2}{\pi e AR}qS, \quad C_L = \frac{L}{qS}, \quad q = \tfrac12\rho v^2
-\;\;\Longrightarrow\;\; \frac{D_i}{m} \propto \frac{n^2}{v^2}$$
-
-계수를 무차원 `k_i`로 묶고, **수평직진(n=1) 대비 증가분만** 취한다.
-
-$$\boxed{\;a_{drag} = g\,k_i\,(n^2-1)\left(\frac{v_{ref}}{v}\right)^2\;}$$
-
-`(n²−1)`을 쓰므로 수평직진에서는 항력이 정확히 0이다. 순항 트림 계산이 필요 없어진다.
-
-추력은 오토스로틀(속도 비례제어)로 준다.
-
-$$\delta_T = \mathrm{clip}\big(k_p\,(v_{ref}-v),\;0,\;1\big), \qquad a_{thrust} = \delta_T\,a_{T,max}$$
-
-$$\boxed{\;v \leftarrow \mathrm{clip}\big(v + (a_{thrust}-a_{drag})\Delta t,\; v_{min},\; v_{max}\big)\;}$$
-
-```python
-# vehicle.py : step()
-n        = 1.0 / np.cos(self.bank)
-a_drag   = self.g * self.k_i * (n**2 - 1.0) * (self.v_ref / self.v) ** 2
-throttle = np.clip(self.k_p * (self.v_ref - self.v), 0.0, 1.0)
-a_thrust = throttle * self.a_thrust_max
-self.v   = np.clip(self.v + (a_thrust - a_drag) * dt, self.min_speed, self.max_speed)
-```
-
-동작:
-
-- 수평직진 → `a_drag = 0`, `v = v_ref`면 `throttle = 0` → **순항속도 정확히 유지**
-- 선회 중 → 속도 하락 → `throttle → 1`, 그러나 항력이 더 커서 **계속 감속**
-- 선회 종료 → 항력 0, 추력 최대 → **속도 회복**
-
-### 3.4 위치
-
-$$\dot x = v\cos\psi, \qquad \dot y = v\sin\psi$$
-
-```python
-self.x += self.v * np.cos(self.head) * dt
-self.y += self.v * np.sin(self.head) * dt
-```
-
-### 3.5 적분 방식과 갱신 순서
-
-전진 오일러(explicit Euler), `dt = 0.05 s` (20 Hz).
-`step()` 안에서의 갱신 순서는 다음과 같다.
-
-```
-1. bank      갱신  (레이트 리미터)
-2. alat      계산  (갱신된 bank 사용)
-3. v         갱신  (갱신된 bank 로 구한 항력 사용)
-4. head_rate 계산  (갱신된 alat, 갱신된 v 사용)
-5. head      갱신
-6. x, y      갱신  (갱신된 v, 갱신된 head 사용)
-```
-
-즉 모든 미분값을 스텝 시작 시점 상태로 계산하는 완전 명시적 방식이 아니라,
-갱신된 값을 순차적으로 쓰는 **semi-implicit(Gauss–Seidel) 방식**이다.
-`dt = 0.05`에서 오차는 무시할 수준이다.
-
-> **적분기에 대한 참고 (측정치)**: "오일러가 원운동을 나선으로 벌린다"는 통념은 이 모델에서 성립하지 않는다.
-> `psi_dot`이 `(v, phi)`에만 의존하고 `x, y`로 되먹임되지 않으므로, 등속·등뱅크 구간에서 오일러 궤적은
-> 닫힌 정n각형이며 반경 오차는 `O((omega·dt)^2/24)`로 극히 작다.
-> 실측: 4g 선회 한 바퀴에서 해석 반경 1645.0 m 대비 측정 반경 1645.0 m (상대오차 0.0000%).
-> RK4 대비 90초 궤적 오차도 23 m vs 18 m 수준이다. **현재 dt에서 오일러로 충분하다.**
-
----
-
-## 4. 파라미터
-
-| 코드 변수 | 값 | 의미 | 근거 |
-|---|---|---|---|
-| `max_bank` | 82° | 최대 뱅크각 | `n = 7.19g`. 유인기 구조한계 고려 |
-| `max_roll_rate` | 120 °/s | 최대 롤레이트 | 전투기 통상 150~250 °/s의 보수적 값 |
-| `v_ref` | 150 m/s | 순항속도 | 오토스로틀 목표속도 |
-| `min_speed` | 70 m/s | 속도 하한 | 실속 여유 |
-| `max_speed` | 220 m/s | 속도 상한 | §7 참고 (형상항력이 없어 클램프가 필요) |
-| `k_i` | 0.044 | 유도항력 계수 | 아래 역산 |
-| `a_thrust_max` | 0.5·g | 최대 추력가속도 | 추력중량비 T/W ≈ 0.5 |
-| `k_p` | 0.05 | 오토스로틀 이득 | 20 m/s 부족하면 풀스로틀 |
-| `dt` | 0.05 s | 적분 스텝 | 20 Hz. LSTM 입출력 주기와 동일 |
-
-### `k_i` 역산 근거
-
-추력과 항력이 같아지는 지점이 **지속선회 한계** `n_sus`다.
-
-$$a_{T,max} = g\,k_i\,(n_{sus}^2-1) \quad\Longrightarrow\quad
-k_i = \frac{a_{T,max}/g}{n_{sus}^2-1} = \frac{0.5}{3.5^2-1} = 0.044$$
-
-즉 **`n_sus = 3.5 g` (뱅크 73.4°)를 지속선회 한계로 설계**했다.
-전투기 지속선회 성능으로 타당한 값이다.
-
-**검산 (일정 뱅크 20초 유지, v0 = 150 m/s)**
-
-| 뱅크 | `n` [g] | v(5s) | v(10s) | v(20s) | 판정 |
-|---|---|---|---|---|---|
-| 0° | 1.00 | 150.0 | 150.0 | 150.0 | 완전 유지 |
-| 60° | 2.00 | 146.3 | 144.9 | 144.4 | 지속 가능 |
-| 70° | 2.92 | 140.3 | 135.9 | 133.6 | 거의 지속 가능 |
-| 75° | 3.86 | 130.5 | 108.3 | 70.0 | 못 버팀 |
-| 80° | 5.76 | 70.0 | 70.0 | 70.0 | 못 버팀 |
-
-설계값 `n_sus = 3.5g`(73.4°) 경계에서 정확히 갈린다.
-
----
-
-## 5. 기동 생성기 (`sim.py`)
-
-표적은 지속시간과 종료조건을 가진 **기동 단위**를 등확률로 이어 붙여 움직인다.
-매 스텝 상수 가속도를 랜덤 추첨하는 방식이 아니다.
-
-| 모드 | 뱅크 지령 | 파라미터 | 지속시간 |
-|---|---|---|---|
-| `straight` | 0 | — | U(2, 5) s |
-| `turn` | `±phi` 일정 | `phi ~ U(50°, 80°)`, 좌/우 등확률 | U(2, 5) s |
-| `weave` | `±A·sin(2πt/T)` | `A ~ U(75°, 80°)`, `T ~ U(6, 8) s`, 좌/우 등확률 | `n_cycles × T`, `n_cycles ~ {1,2}` |
-
-**위빙이 정수 주기로 끝나는 것이 중요하다.** `sin`은 주기의 정수배에서 정확히 0이므로
-뱅크각이 0인 상태로 기동이 끝나고, 다음 기동으로 매끄럽게 연결된다.
-중간에 자르면 뱅크가 기울어진 채 다음 기동이 시작되고, 좌우 상쇄가 깨져 위빙이 아니라 선회가 된다.
-
-### 위빙 기하 — MPC 담당자가 알아둘 것
-
-뱅크는 완벽한 사인파지만 **진행방향각은 사인파가 아니다.**
-
-$$\phi = A\sin(\omega t) \;\Longrightarrow\;
-\psi(t) = \psi_0 + \frac{a}{v\omega}\big(1-\cos\omega t\big)$$
-
-`(1 − cos)`는 항상 0 이상이므로 **헤딩이 초기값 아래로 내려가지 않는다.**
-즉 궤적은 좌우 대칭 지그재그가 아니라 **한쪽으로 밀리는 계단** 형태다. (버그가 아니라 물리)
-
-궤적의 형상비:
-
-```
-횡진폭 = a / omega^2 = a * T^2 / (4*pi^2)     <- 속도 v 와 무관
-파장   = v * T                                <- 속도에 비례
-```
-
-| 뱅크 | T [s] | v | 진폭 [m] | 파장 [m] | 진폭/파장 | 선회반경 [m] |
-|---|---|---|---|---|---|---|
-| 75° | 7.5 | 150 | 52 | 1125 | 0.046 | 615 |
-| 80° | 7.5 | 150 | 79 | 1125 | 0.070 | 404 |
-| 80° | 15 | 150 | 317 | 2250 | 0.141 | 404 |
-
-진폭이 파장의 5~15% 수준이라 궤적이 납작하게 보이는 것이 정상이다.
-근본 원인은 선회반경이며, 기하학적 한계다.
-
-### 검증 통계 (300회 × 45초)
-
-```
-45초 총 헤딩변화 : 평균  296 deg   (최소 104 / 최대 749)
-최대 하중배수    : 평균 5.08 g     (뱅크 78.6 deg)
-속도 변동폭      : 평균 24.9 m/s
-평균 속도        : 139.0 m/s       (v_ref = 150)
-min_speed 고착   :   0.9 %
-평균 기동 지속   :  7.59 s
-모드 시간점유율  : straight 20% / turn 22% / weave 58%
-순 방향변화 평균 :  -5.7 deg       (좌 48% / 우 52%, 편향 없음)
-```
-
-> weave가 시간의 58%를 차지하는 이유: 등확률로 뽑아도 위빙 한 번의 지속시간(6~16초)이
-> 다른 기동(2~5초)보다 훨씬 길기 때문. `weights`는 선택 확률이지 시간 점유율이 아니다.
-> 시간 점유율을 직접 지정하려면 `w_i ∝ 목표점유율_i / 기대지속시간_i`로 역산할 것.
-
----
-
-## 6. LSTM 표적 예측기
-
-`model.py`의 `LSTMModel`(신경망) + `TargetPredictor`(추론 래퍼), 학습은 `LSTM.py`.
-
-### 6.1 입출력 규약 — MPC 담당자가 알아야 할 핵심
-
-**모든 입출력은 "예측 시점의 표적 상태" 기준 상대좌표계다.** 절대좌표가 아니다.
-
-```
-좌표계 원점 : 예측 시점의 표적 위치      (history의 마지막 샘플)
-      x축 : 예측 시점의 표적 속도 방향
-      y축 : 그에 수직 (반시계)
-
-입력  (40, 4)  : 과거 40스텝 x [상대x, 상대y, 상대vx, 상대vy]
-                 = 2.0초 관측 (dt = 0.05 s)
-출력  (20, 2)  : 미래 20스텝 x [상대x, 상대y]
-                 = 1.0초 예측, 0.05초 간격
-```
-
-절대좌표로 학습시키면 표적이 항상 `(-1500, 500)`에서 출발하므로 네트워크가 특정 좌표대를
-외워버린다. 상대좌표로 바꾸면 평행이동·회전 불변이 되어 일반화가 크게 개선된다.
-
-**`TargetPredictor.predict()`는 절대좌표로 되돌려서 반환한다.** MPC 쪽에서 역변환할 필요 없다.
-
-```python
-from model import TargetPredictor
-
-predictor = TargetPredictor()        # .pth + scaler 2개를 한 번만 로드
-pred = predictor.predict(history)    # history: 최근 40개 (x, y, vx, vy)
-# pred.shape == (20, 2), 전역좌표 [m], pred[k]는 (k+1)*0.05초 뒤 표적 위치
-```
-
-`history`는 `Vehicle.get_pos_vel()` 반환값(`[x, y, vx, vy]`)을 `deque(maxlen=40)`에 쌓은 것이다.
-`Sim.simulation()`이 이미 그렇게 하고 있다.
-
-### 6.2 신경망 구조
-
-```
-LSTM(input=4, hidden=64, layers=2, batch_first)
-  -> 마지막 타임스텝 hidden state (64)
-  -> Linear(64, 32) -> ReLU -> Linear(32, 40)
-  -> reshape(20, 2)
-```
-
-학습 설정: 시뮬 1000회 x 30초, MSE loss, Adam(lr=1e-4), 30 epochs, batch 64.
-정규화는 `MinMaxScaler(-1, 1)`, **train split으로만 fit**하고 valid/test는 `transform`만 적용.
-
-### 6.3 측정된 예측 성능
-
-학습에 쓰지 않은 seed 2000~2009, 예측 8,430건 기준 (위치오차 단위: m)
-
-| 방법 | 전체 평균 | 1초 뒤 평균 | 1초 뒤 최대 |
-|---|---|---|---|
-| **LSTM** | **0.482** | **1.415** | 17.902 |
-| 등속직진 외삽 | 3.291 | 8.922 | 31.430 |
-| 등속선회 외삽 (현재 선회율 유지) | 1.128 | 3.552 | 21.149 |
-
-- 등속직진 대비 6.3배, 등속선회 대비 2.5배 정확하다. §9.8의 베이스라인 비교 요구사항을 이미 만족한다.
-- 예측 시점이 멀수록 오차가 커진다: 1스텝(0.05초) 0.08 m → 20스텝(1초) 1.4 m.
-- **최대오차 17.9 m.** 평균만 보고 신뢰하면 안 된다. 급기동 구간에서 튄다.
-
-### 6.4 한계 — MPC 설계 시 반드시 감안할 것
-
-1. **관측 노이즈를 학습하지 않았다.** 참값(`get_pos_vel()`)만 입력받았다. 레이더 노이즈가 섞이면
-   성능이 크게 떨어질 수 있다. 노이즈를 도입한다면 **학습 데이터에도 같은 노이즈를 넣어 재학습**해야 한다.
-2. **예측 지평이 1초로 고정이다.** `output_size=40`(= 20스텝 x 2)이 네트워크 구조에 박혀 있어
-   더 먼 미래가 필요하면 재학습해야 한다. MPC 지평 설계 시 이 1초가 상한이다.
-3. **모드 전환은 예측 불가능하다.** 표적의 straight/turn/weave 전환은 난수로 결정되므로 원리적으로
-   예측할 수 없다. 다만 전환은 2~8초마다 일어나 1초 지평에 걸리는 경우가 드물어, 실측상 영향은
-   제한적이다 (전환 포함 구간 1.91 m vs 미포함 1.29 m).
-4. **워밍업 40스텝(2초)이 필요하다.** 그 전에는 예측이 나오지 않는다. §9.9 참고.
-
----
-
-## 7. 현재 모델의 알려진 한계
-
-MPC 담당자가 알고 있어야 할 항목들이다.
-
-1. **V-n 포락선이 없다.** 저속에서도 `max_bank`까지 뱅크를 걸 수 있다. 실제로는
-   `n_max(v) = min(구조한계, (v/v_stall)²)`로 제한되어야 한다. 그 결과 80° 이상 지속선회 시
-   불가능한 g를 내고 그만큼 과도한 항력을 받아 `min_speed`로 급락한다(5초 내). 전체 시뮬 시간의
-   0.9%에 불과해 실용상 문제는 작다.
-
-2. **형상항력이 없다.** 최고속도를 결정하는 항이 `∝ v²`인 형상항력인데 이를 뺐으므로
-   자연스러운 최고속도가 없다. `max_speed = 220` 클램프가 안전장치가 아니라 **물리를 대신**하고 있다.
-   현재 오토스로틀이 `v > v_ref`에서 `throttle = 0`이 되므로 실질적으로는 문제되지 않는다.
-
-3. **`self.head`가 wrap되지 않는다.** 계속 누적되어 커진다. `cos`/`sin`은 주기함수라 궤적은 정확하지만,
-   시계열 플롯·LSTM 입력·각도 차 계산 시에는 `[-pi, pi)`로 정규화해야 한다.
-
-4. **롤 1차 지연 미구현.** §3.1 참고. 궤적 품질에 실질적 영향 없음.
-
-5. **미사일이 움직이지 않는다.** `missile.py`에 `Missile` 클래스가 생겼고 `main.py`가 인스턴스를
-   만들지만, `Sim.simulation()`이 `get_state()`만 호출하고 `step()`은 호출하지 않아 원점에 고정되어
-   있다. 유도법칙이 붙기 전까지는 정상이다. §9.1 참고.
-
-6. ~~시드 고정 불가~~ → **해결됨.** `Sim(..., seed=None)`이 `self.rng = random.Random(seed)`를
-   쓴다. 데이터셋은 seed 0~999로 재현 가능하다.
-
-7. **관측 노이즈 없음.** 현재 참값만 나온다. 레이더 모사 노이즈는 **참값과 분리해서** 저장해야 한다.
-   LSTM이 무노이즈로 학습된 점도 함께 고려할 것 (§6.4).
-
----
-
-## 8. 좌표계 및 부호 규약
-
-- 우수 좌표계, X축 기준 반시계방향이 `psi` 양의 방향
-- `phi > 0` → 좌선회 (반시계), `phi < 0` → 우선회
-- `a_lat = g·tan(phi)`이므로 `a_lat`의 부호도 동일
-- 각도 단위는 코드 내부에서 전부 **rad**. 입출력/플롯에서만 deg 변환
-
----
-
-## 9. MPC 담당자를 위한 권장사항
-
-### 9.1 미사일은 `Vehicle`을 쓰면 안 된다
-
-미사일은 뱅크를 걸지 않는다. 핀(fin)으로 횡가속도를 직접 만들기 때문에
-뱅크각·양력·유도항력 개념 자체가 없다. **별도 `Missile` 클래스를 만들 것.**
-
-```
-x'      = v * cos(psi)
-y'      = v * sin(psi)
-psi'    = a_lat / v
-a_lat'  = (a_lat_cmd - a_lat) / tau          # 오토파일럿 지연
-
-제어입력 u = a_lat_cmd
-```
-
-권장 파라미터:
-
-| 항목 | 권장값 | 비고 |
-|---|---|---|
-| `v` | 400~600 m/s | **표적(150 m/s)의 2~3배 필수.** 속도 우위가 없으면 기동표적 요격 불가 |
-| `a_lat_max` | 30~40 g | 표적(최대 7g)보다 충분히 커야 함 |
-| `tau` | 0.1~0.3 s | 오토파일럿 응답 시정수 |
-
-`Vehicle`보다 오히려 단순하다. `bank`, `k_i`, `throttle` 전부 불필요.
-
-### 9.2 예측모델 — 선형화가 필요 없다
-
-논문은 비선형 미사일 모델을 매 스텝 선형화하지만, **상대 상태로 세우면 애초에 선형**이므로 훨씬 쉽다.
-
-```
-상태  X = [rx, ry, vrx, vry]^T        (표적 - 미사일 의 상대 위치/속도)
-
-X_{k+1} = A*X_k + B*u_k + E*a_target_k
-
-      | I   dt*I |          | -0.5*dt^2*I |          | 0.5*dt^2*I |
-A =   | 0     I  |    B =   |   -dt*I     |    E =   |    dt*I    |
-```
-
-`A`, `B`, `E`가 상수이므로 예측행렬을 **한 번만 만들어두면 된다.**
-
-### 9.3 위치를 예측할 경우 — 더 간단해진다
-
-본 프로젝트의 LSTM은 위치를 예측하므로, MPC 안에서 표적을 굴릴 필요가 없다.
-**미사일만 굴리고 표적은 예측값을 그대로 쓴다.**
-
-```
-x_m[k+1] = A*x_m[k] + B*u_k                 # 미사일만, 이중적분기
-P_m      = F*x_m0 + G*U                     # E, H 항 소멸
-
-비용:
-J = sum_k || p_pred[k] - P_m[k] ||^2 * Q  +  ||U||^2 * R  +  ||dU||^2 * S
-
-e = p_pred - F*x_m0                         # 이미 아는 상수벡터
-J = || G*U - e ||^2_Q + ...
-```
-
-### 9.4 QP 표준형
-
-```
-min  0.5 * U^T W U + c^T U
- U
-      W = 2 * (G^T Q G + R + S_term)
-      c = -2 * G^T Q e
-
-s.t.  E_ineq * U <= b
-        |u_k|  <= a_lat_max        (미사일 기동 한계)
-        |du_k| <= da_max           (지령 변화율 한계)
-```
-
-- `|u| <= a_max`를 원형으로 걸면 SOCP가 된다. **처음엔 박스 제약**(`|ux|, |uy| <= a_max`)으로
-  QP를 유지할 것. 보수적이지만 충분하다.
-- QP 솔버는 `qpsolvers` + `osqp` 권장 (`pip install qpsolvers[osqp]`).
-  `cvxpy`는 작성이 편하나 매 스텝 풀기엔 느리다.
-
-### 9.5 MPC 주기를 시뮬 주기와 분리할 것
-
-`dt = 0.05` (20 Hz)로 매 스텝 QP를 푸는 것은 낭비일 수 있다. 실제 유도루프는 10~20 Hz다.
-
-```python
-if step % mpc_every == 0:              # mpc_every = 2  -> 10 Hz
-    u = mpc.solve(...)
-missile.update_alat(u)                 # 사이 구간은 지령 유지 (ZOH)
-missile.step(dt)
-```
-
-`mpc_every = 2`로 두면 LSTM 예측 20개 중 **짝수 인덱스만** 쓰게 된다 (§9.6 참고).
-
-### 9.6 20개 예측 중 무엇을 쓸 것인가 — **하나만 고르는 게 아니다**
-
-가장 자주 나오는 오해다. MPC는 예측값 하나를 조준점으로 삼는 방식이 아니라,
-**20개 전체를 기준궤적(reference trajectory)으로 놓고 지평 전체의 오차합을 최소화**한다.
-
-```
-p_pred[k]  = LSTM 예측 (k+1)*0.05초 뒤 표적 위치      k = 0..19
-P_m[k]     = 미사일이 u를 넣었을 때의 같은 시각 예측 위치
-
-J = sum_{k=0}^{Np-1} || p_pred[k] - P_m[k] ||^2 * Q[k]  +  ||U||^2 * R  +  ||dU||^2 * S
-```
-
-즉 `k`번째 예측은 `k`번째 미사일 예측위치와 **시각을 맞춰서** 짝지어진다.
-"20개 중 하나 고르기"가 아니라 "20쌍의 오차를 동시에 줄이기"다.
-
-**가중치 `Q[k]` 설계가 실질적인 선택이다.**
-
-| 방식 | `Q[k]` | 의미 | 언제 |
-|---|---|---|---|
-| 균등 | 전부 동일 | 지평 전체를 고르게 추종 | 기본값. 여기서 시작할 것 |
-| 종단 가중 | 뒤로 갈수록 크게, `Q[Np-1]` 특히 크게 | 요격은 **마지막 시점**에 일어나므로 종단 일치가 중요 | 균등이 잘 돌면 다음 단계 |
-| 신뢰도 반영 | 앞쪽 크게 | 예측오차가 뒤로 갈수록 커짐 (0.08 m → 1.4 m, §6.3) | 종단 가중과 상충. 실험으로 결정 |
-
-종단 가중과 신뢰도 반영이 정반대 방향이라는 점에 주의할 것. 요격 기하상 종단이 중요하지만
-그 지점의 예측이 가장 부정확하다. **균등 가중으로 먼저 돌려보고 miss distance로 판단**하는 것이 안전하다.
-
-**지평 길이 `Np`와 남은 비행시간(`tgo`)의 관계**가 실제로 더 중요하다.
-
-```
-tgo > 1.0초  : LSTM 지평(1초)이 요격 시점에 못 미친다
-               -> Np = 20 전체를 쓰되, 이 구간에서는 MPC가 "따라붙기"만 한다
-               -> 또는 마지막 예측점에서 등속직진으로 외삽해 지평을 늘린다 (오차 감수)
-
-tgo <= 1.0초 : 요격 시점이 예측 지평 안에 들어온다. 여기서부터가 진짜 승부
-               -> Np = ceil(tgo / 0.05) 로 줄여서 예측 지평 밖을 참조하지 않게 할 것
-               -> 지나간 예측점을 계속 참조하면 이미 틀린 곳을 조준하게 된다
-```
-
-`Np`를 `tgo`에 맞춰 줄이는 것은 **필수**다. 고정 `Np = 20`으로 두면 종말단계에서
-요격점 너머를 계속 참조하게 된다.
-
-> **MPC 주기가 10 Hz면 예측을 2개씩 건너뛴다.** LSTM 출력은 20 Hz(0.05초 간격)이므로,
-> 10 Hz MPC는 `p_pred[1], p_pred[3], p_pred[5], ...`를 쓰거나 `mpc_every`에 맞춰 인덱싱해야 한다.
-> 시각 정렬이 어긋나면 조용히 성능만 나빠지므로 여기서 실수하지 말 것.
-
-**LSTM 입출력 규약 자체는 §6.1에 정리되어 있다.** `TargetPredictor.predict()`가
-전역좌표로 되돌려서 반환하므로 MPC 쪽에서 회전행렬을 다룰 필요는 없다.
-
-### 9.7 구현 순서 — 이 순서를 강력히 권장
-
-성능을 주장하려면 비교군이 필요하고, 단계마다 검증 가능해야 한다.
-
-| 단계 | 내용 | 목적 |
-|---|---|---|
-| ① | **PN (비례항법)** | 베이스라인. 요격 기하가 성립하는지 먼저 확인 |
-| ② | **예측 없는 MPC** (`a_target = 0`, 등속직진 가정) | QP가 제대로 풀리는지 검증. PN과 비슷하게 나와야 정상 |
-| ③ | **완벽 예측 MPC (oracle)** — 시뮬의 진짜 미래값 주입 | 예측이 완벽할 때의 **성능 상한** 측정 |
-| ④ | **LSTM 예측 MPC** | 최종 |
-
-②③④의 miss distance를 비교하면 **"예측이 얼마나 기여했는가"**가 숫자로 나온다.
-
-PN 참고식:
-
-```
-r          = p_target - p_missile
-v_rel      = v_target - v_missile
-lambda_dot = (r x v_rel)_z / (r . r)
-Vc         = -(r . v_rel) / |r|
-a_cmd      = N * Vc * lambda_dot            # N = 3 ~ 5
-```
-
-### 9.8 검증용 베이스라인 — ✅ 완료
-
-LSTM 성능 평가 시 **등속직진 가정**과 반드시 비교할 것.
-
-```
-p_pred[k] = p_now + v_now * (k * dt)
-```
-
-**측정 완료. §6.3 참고.** LSTM 1.415 m vs 등속직진 8.922 m (1초 뒤 평균오차)로
-6.3배 우위를 확인했다. 등속선회 외삽(3.552 m)과 비교해도 2.5배 낫다.
-
-miss distance 비교(§9.7의 ②③④)는 아직 남아 있다.
-
-### 9.9 워밍업 구간 처리
-
-LSTM은 40스텝(2초) 이력이 쌓여야 예측을 시작한다. 그 전에는 `TargetPredictor.predict()`를
-호출할 수 없다. 시뮬 시작 후 2초 동안 미사일을 어떻게 할지 정해야 한다.
-
-```python
-history = deque(maxlen=40)
-...
-if len(history) == 40:
-    pred = predictor.predict(history)
-    u = mpc.solve(pred, ...)
-else:
-    u = pn_guidance(...)        # 또는 발사 지연, 또는 등속직진 가정 MPC
-```
-
-권장: **워밍업 구간은 PN으로 돌리고 2초 후 MPC로 전환**한다. §9.7의 ①을 먼저 구현하면
-그대로 재활용할 수 있다. 표적이 멀리 있는 초기 2초는 어차피 정밀 유도가 필요 없는 구간이다.
-
----
-
-## 10. 파일 구조
-
-```
-vehicle.py          표적 운동모델 (2D 협조선회)
-missile.py          미사일 운동모델 (횡가속도 직접 입력, 뱅크 개념 없음)
-sim.py              기동 생성기 + 시뮬레이션 루프 + 플롯
-model.py            LSTMModel (신경망) + TargetPredictor (추론 래퍼)
-LSTM.py             LSTM 학습 스크립트 (실행 시 .pth / .pkl 생성)
-LSTM_colab.ipynb    Colab GPU 학습용 노트북 (sim/vehicle 코드 인라인 포함)
-main.py             진입점
-refer.py            별도 참고 구현 (본 파이프라인 미사용)
-
-lstm_model.pth      학습된 가중치
-x_scaler.pkl        입력 스케일러
-y_scaler.pkl        출력 스케일러
-```
-
-**추가 예정**
-
-```
-guidance.py         PN / MPC
-```
-
----
-
-## 11. MPC 담당자 인수인계 요약
-
-바로 시작하려면 이 순서로 읽을 것.
-
-1. **§6.1** — LSTM이 무엇을 받고 무엇을 뱉는지. `predictor.predict(history) -> (20, 2)` 전역좌표.
-2. **§9.6** — 그 20개를 MPC에서 어떻게 쓰는지. (하나 고르는 게 아니다)
-3. **§9.1** — 미사일 모델. `missile.py`가 이미 그 형태로 있지만 **오토파일럿 지연(`tau`)이 없고
-   `v`가 `main.py`에서 100 m/s로 설정되어 있다.** 표적(150 m/s)보다 느려서 이대로는 요격이 불가능하니
-   400~600 m/s로 올릴 것.
-4. **§9.7** — 구현 순서. PN부터 만들 것.
-5. **§6.4, §7** — 알려진 한계. 특히 관측 노이즈 없음, 예측 지평 1초 고정.
-
-**지금 바로 손봐야 하는 것**
-
-| 항목 | 위치 | 내용 |
-|---|---|---|
-| 미사일이 안 움직임 | `sim.py: simulation()` | `self.missile.step(dt)` 호출이 없다 |
-| 미사일 속도 부족 | `main.py:9` | `v=100` → 400~600으로 |
-| 오토파일럿 지연 없음 | `missile.py` | `alat`이 지령 즉시 반영된다. `tau` 추가 필요 |
-| `head` wrap 안 됨 | `vehicle.py`, `missile.py` | 각도 차 계산 시 `[-pi, pi)` 정규화 필요 (§7-3) |
+### 3.7 Receding horizon
+
+QP로 계산한 최적 제어입력 시퀀스는 다음과 같다.
+
+$$
+U^*=
+\begin{bmatrix}
+u_0^*&u_1^*&\cdots&u_{N-1}^*
+\end{bmatrix}^T
+$$
+
+실제 요격체에는 첫 번째 입력만 적용한다.
+
+$$
+u_{\mathrm{applied}}=u_0^*
+$$
+
+다음 제어주기에는 갱신된 미사일 상태와 새로운 LSTM 예측으로 같은 최적화 문제를 다시 계산한다.
+
+## 4.시뮬레이션 결과
+
+다음은 시뮬레이션 결과이다. 총 4번의 시뮬레이션을 하였고 모두 요격하는데 성공하였다.
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/images/simulation-dynamic-01.png" width="100%">
+    </td>
+    <td width="50%">
+      <img src="docs/images/simulation-dynamic-02.png" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/images/simulation-dynamic-03.png" width="100%">
+    </td>
+    <td width="50%">
+      <img src="docs/images/simulation-dynamic-04.png" width="100%">
+    </td>
+  </tr>
+</table>
+
+## 5. 문제점
+
+물체가 복잡하게 움직였을때 요격을 실패하거나 아니면 거친 원운동을 하여 요격을 하는 경우가 있음
