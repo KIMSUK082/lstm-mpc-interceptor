@@ -16,6 +16,7 @@ class Sim:
         mpc=None,
         observation_time=2.0,
         intercept_radius=10.0,
+        maneuver_profile="standard",
     ):
         self.missile = missile
         self.target = target
@@ -26,6 +27,7 @@ class Sim:
         self.mpc = mpc
         self.observation_time = float(observation_time)
         self.intercept_radius = float(intercept_radius)
+        self.maneuver_profile = maneuver_profile
 
         if self.dt <= 0.0:
             raise ValueError("dt must be greater than zero.")
@@ -33,6 +35,8 @@ class Sim:
             raise ValueError("observation_time must provide at least 40 samples.")
         if self.intercept_radius <= 0.0:
             raise ValueError("intercept_radius must be greater than zero.")
+        if self.maneuver_profile not in {"standard", "dynamic"}:
+            raise ValueError("maneuver_profile must be 'standard' or 'dynamic'.")
 
         self.current_mode = None
         self.move_start_time = 0.0
@@ -46,9 +50,14 @@ class Sim:
     def select_new_move(self, time):
         self.move_start_time = time
 
+        if self.maneuver_profile == "dynamic":
+            mode_weights = [0.05, 0.25, 0.70]
+        else:
+            mode_weights = [0.33, 0.34, 0.33]
+
         self.current_mode = self.rng.choices(
             population=["straight", "turn", "weave"],
-            weights=[0.33, 0.34, 0.33],
+            weights=mode_weights,
             k=1,
         )[0]
 
@@ -56,19 +65,30 @@ class Sim:
 
         if self.current_mode == "straight":
             self.bank = 0.0
-            duration = self.rng.uniform(2.0, 5.0)
+            if self.maneuver_profile == "dynamic":
+                duration = self.rng.uniform(0.75, 1.5)
+            else:
+                duration = self.rng.uniform(2.0, 5.0)
 
         elif self.current_mode == "turn":
             direction = self.rng.choice([-1.0, 1.0])
-            bank_deg = self.rng.uniform(50.0, 80.0)
+            if self.maneuver_profile == "dynamic":
+                bank_deg = self.rng.uniform(45.0, 75.0)
+                duration = self.rng.uniform(1.0, 2.5)
+            else:
+                bank_deg = self.rng.uniform(50.0, 80.0)
+                duration = self.rng.uniform(2.0, 5.0)
             self.bank = direction * np.radians(bank_deg)
-            duration = self.rng.uniform(2.0, 5.0)
 
         elif self.current_mode == "weave":
-            amplitude_deg = self.rng.uniform(75.0, 80.0)
             direction = self.rng.choice([-1.0, 1.0])
+            if self.maneuver_profile == "dynamic":
+                amplitude_deg = self.rng.uniform(70.0, 82.0)
+                self.weave_period = self.rng.uniform(3.5, 5.0)
+            else:
+                amplitude_deg = self.rng.uniform(75.0, 80.0)
+                self.weave_period = self.rng.uniform(6.0, 8.0)
             self.bank = direction * np.radians(amplitude_deg)
-            self.weave_period = self.rng.uniform(6.0, 8.0)
             n_cycles = self.rng.randint(1, 2)
             duration = n_cycles * self.weave_period
 
@@ -84,7 +104,10 @@ class Sim:
         elif self.current_mode == "weave":
             weave_time = time - self.move_start_time
 
-            bank_cmd = self.bank * np.sin(2.0 * np.pi * weave_time / self.weave_period)
+            wave = np.sin(2.0 * np.pi * weave_time / self.weave_period)
+            if self.maneuver_profile == "dynamic":
+                wave = np.tanh(2.5 * wave)
+            bank_cmd = self.bank * wave
             ## bank_cmd=bank_amplitude*sin(2pi/T*n)
 
         else:
@@ -153,9 +176,22 @@ class Sim:
 
             bank_cmd = self.get_command(time)
 
-            pred_abs = self.predictor.predict(history)
-            alat_cmd = self.mpc.solve(self.missile.get_state(), pred_abs)
-            predictions.append(pred_abs)
+            predicted_accelerations = self.predictor.predict(history)
+            alat_cmd = self.mpc.solve(
+                self.missile.get_state(),
+                self.target.get_state(),
+                predicted_accelerations,
+            )
+
+            predicted_position = history[-1][0:2].copy()
+            predicted_velocity = history[-1][2:4].copy()
+            predicted_positions = []
+            for acceleration in predicted_accelerations:
+                predicted_velocity += acceleration * self.dt
+                predicted_position += predicted_velocity * self.dt
+                predicted_positions.append(predicted_position.copy())
+
+            predictions.append(np.asarray(predicted_positions))
             self.prediction_origins.append(self.target.get_state()[0:2].copy())
 
             self.missile.update_alat(alat_cmd)

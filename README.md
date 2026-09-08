@@ -2,472 +2,191 @@
 
 표적 항공기의 과거 2초 궤적을 LSTM에 입력하여 미래 위치를 예측하고, 예측된 표적 위치를 기준 궤적으로 사용하는 MPC를 통해 요격체의 횡가속도를 결정하는 2차원 시뮬레이터이다.
 
-## 1. 표적 항공기 운동
+## 1. 문제 설정
 
-### 1.1 상태 정의
+회피 기동하는 표적을 요격체가 추격한다. 두 비행체 모두 횡가속도로 조종되는
+점질량으로 모델링하며, 요격체의 속력은 일정하게 유지한다.
 
-표적 항공기의 상태는 다음과 같이 정의하였다.
+|               | 표적                | 요격체              |
+| ------------- | ------------------- | ------------------- |
+| 속력          | $150\ \mathrm{m/s}$ | $300\ \mathrm{m/s}$ |
+| 횡가속도 한계 | $8g$                | $20g$               |
+| 제어 입력     | $[a_p,\ a_v,\ a_s]$ | $[a_v,\ a_s]$       |
 
-$$
-\mathbf{x}_{\mathrm{vehicle},k} =
-\begin{bmatrix}
-p_{x,k} \\
-p_{y,k} \\
-v_k \\
-\psi_k \\
-\phi_k
-\end{bmatrix}
-$$
+요격체의 상태는 $\mathbf{x}=[p_x,p_y,p_z,\gamma,\psi]^\top$ 이고 $\gamma$ 는 비행경로각,
+$\psi$ 는 방위각이다.
 
-표적은 외부에서 뱅크각 명령 $\phi_{\mathrm{cmd}}$를 받는다. 표적은 뱅크각 명령에따라 각각 다른 움직임을 만들어 낸다.
-
-### 1.2 방향각과 위치 갱신
-
-뱅크각이 변하면 표적의 횡가속도가 변한다. 횡가속도는 진행방향 각속도를 만들고, 갱신된 진행방향에 따라 표적의 위치가 변한다.
+각속도와 속도는 다음과 같이 정의된다.
 
 $$
-\begin{aligned}
-a_{\mathrm{lat},k}
-&= g\tan\phi_k, \\
-\dot{\psi}_k
-&= \frac{a_{\mathrm{lat},k}}{v_k}, \\
-\psi_{k+1}
-&= \psi_k+\dot{\psi}_k\Delta t, \\
-v_{x,k+1}
-&= v_{k+1}\cos\psi_{k+1}, \\
-v_{y,k+1}
-&= v_{k+1}\sin\psi_{k+1}, \\
-p_{x,k+1}
-&= p_{x,k}+v_{k+1}\cos\psi_{k+1}\Delta t, \\
-p_{y,k+1}
-&= p_{y,k}+v_{k+1}\sin\psi_{k+1}\Delta t.
-\end{aligned}
+\dot\gamma=\frac{a_v}{V},\qquad
+\dot\psi=\frac{a_s}{V\cos\gamma},\qquad
+\dot{\mathbf p}=V\begin{bmatrix}\cos\gamma\cos\psi\\ \cos\gamma\sin\psi\\ \sin\gamma\end{bmatrix}
 $$
 
-표적이 선회할 때 발생하는 속도 감소와 추력에 의한 속도 회복은 시뮬레이션 편의를 위한 단순 모델로만 구현하였다.
+교전은 다음 초기 조건에서 시작한다.
 
-### 1.3 표적 기동 종류
+|                            | 표적                                 | 요격체                    |
+| -------------------------- | ------------------------------------ | ------------------------- |
+| 초기 위치                  | $(-2000,\ -1500,\ 1200)\ \mathrm{m}$ | $(0,\ 0,\ 0)\ \mathrm{m}$ |
+| 초기 비행경로각 $\gamma_0$ | $5^\circ$                            | $25.6^\circ$              |
+| 초기 방위각 $\psi_0$       | $80^\circ$                           | $-143.1^\circ$            |
 
-학습 데이터와 요격 시뮬레이션에서는 자연스러운 표적의 움직임을 위해 다음 3가지 기동중 무작위로 하나의 기동이 선택되어 랜덤한 시간동안 한모드의 기동이 작동한다.
+요격체는 발사 시점에 표적 방향으로 조준되어 출발하므로, $\gamma_0$ 와 $\psi_0$ 는
+초기 상대위치 벡터로부터 결정된다.
 
-- `straight`
-- `turn`
-- `weave`
+제어 주기는 $\Delta t=0.05\ \mathrm{s}$ ($20\ \mathrm{Hz}$)이다. 요격체는 유도를
+시작하기 전 $2\ \mathrm{s}$ 동안 표적을 관측하며, 이 구간이 LSTM 입력 $40$스텝을
+채운다.
 
-Weave 기동의 뱅크각 명령은 다음과 같다.
+## 2. 표적 기준 좌표계 정규화
 
-$$
-\phi_{\mathrm{cmd}}(t) =
-\phi_{\max}
-\sin
-\left(
-\frac{2\pi}{T_{\mathrm{weave}}}(t-t_0)
-\right)
-$$
+두 예측기는 동일한 입력을 받는다 — 표적의 최근 $40$스텝 상태(위치와 속도,
+$2\ \mathrm{s}$). 절대 좌표를 그대로 넣으면 LSTM이 좌표 자체를 외워버리므로,
+표적 기준의 상대좌표계로 변환해서 넣는다.
 
-## 2. LSTM 구현과 데이터 전처리
-
-### 2.1 데이터 구성
-
-표적 기동 시뮬레이션을 반복하여 LSTM 학습 데이터를 생성하였다.
-
-LSTM 입력은 과거 40개 상태이다.
+현재 속도 $\mathbf v_t$ 로부터 정규직교 기저를 만든다.
 
 $$
-\mathbf{X}_{\mathrm{LSTM}}
-\in
-\mathbb{R}^{40\times4}
+\hat{\mathbf f}=\frac{\mathbf v_t}{\lVert\mathbf v_t\rVert},\qquad
+\hat{\mathbf s}=\frac{\hat{\mathbf z}\times\hat{\mathbf f}}{\lVert\hat{\mathbf z}\times\hat{\mathbf f}\rVert},\qquad
+\hat{\mathbf u}=\hat{\mathbf f}\times\hat{\mathbf s},\qquad
+\mathbf R_t=\begin{bmatrix}\hat{\mathbf f}^\top\\ \hat{\mathbf u}^\top\\ \hat{\mathbf s}^\top\end{bmatrix}
 $$
 
-출력은 미래 20개 상대 위치이다.
+이후 $\mathbf{R}_t^\top$를 곱해 입력 데이터를 표적 기준 국소 좌표계로 정규화한다.
 
 $$
-\mathbf{Y}_{\mathrm{LSTM}}
-\in
-\mathbb{R}^{20\times2}
+\mathbf X_t=\Big[\ (\mathbf p_{t-k}-\mathbf p_t)\,\mathbf R_t^\top\ \big|\ \mathbf v_{t-k}\,\mathbf R_t^\top\ \Big]_{k=39}^{0}\in\mathbb R^{40\times 6}
 $$
 
-### 2.2 상대좌표 변환
+두 방식은 예측기의 출력을 어느 좌표계로 돌려주느냐에서 갈린다.
 
-절대좌표를 그대로 학습하면 모델이 표적의 실제 운동보다 특정 위치 범위를 학습할 가능성이 있다. 이를 줄이기 위해 마지막 관측 시점의 표적 위치를 원점으로 하고 현재 진행방향을 X축으로 하는 상대좌표를 사용하였다.
-
-마지막 관측 시점의 위치와 속도를 각각 $\mathbf{p}_c$, $\mathbf{v}_c$라고 하면 현재 방향각은 다음과 같다.
+A 방식은 표적의 국소 좌표계 가속도를 그대로 반환한다.
 
 $$
-\theta_c =
-\mathrm{atan2}
-\left(
-v_{y,c},
-v_{x,c}
-\right)
+\hat{\mathbf a}^{\,\mathrm{loc}}_{t+j}\in\mathbb{R}^{3},
+\qquad j=1,\dots,8
 $$
 
-전역좌표를 표적 진행방향 기준 좌표로 회전하는 행렬은 다음과 같다.
+각 성분은 $[a_p,\ a_v,\ a_s]$ 이고, MPC가 이를 표적 상태방정식의 외란으로 그대로
+사용하므로 절대 좌표계로 되돌리는 단계가 없다.
+
+B 방식은 국소좌표에서 예측한 상대 위치를 절대좌표로 복원하여 MPC의 기준 위치로 사용한다.
 
 $$
-R=
-\begin{bmatrix}
-\cos\theta_c & \sin\theta_c \\
--\sin\theta_c & \cos\theta_c
-\end{bmatrix}
+\hat{\mathbf p}_{t+j}
+=\hat{\mathbf p}^{\,\mathrm{loc}}_{t+j}\,\mathbf R_t+\mathbf p_t,
+\qquad j=1,\dots,100
 $$
 
-과거 위치와 속도는 다음과 같이 상대좌표로 변환한다.
+## 3. 공통 MPC 최적화
+
+두 방식 모두 비선형 운동 모델을 사용하므로, 이전 제어열로 생성한 공칭 궤적 주변에서 매 예측 시점의 모델을 수치 선형화하였다.
 
 $$
-\begin{aligned}
-\mathbf{p}_{\mathrm{rel},i}
-&=R(\mathbf{p}_i-\mathbf{p}_c), \\
-\mathbf{v}_{\mathrm{rel},i}
-&=R\mathbf{v}_i.
-\end{aligned}
-$$
-
-따라서 LSTM의 입력은 다음과 같다.
-
-$$
-\mathbf{z}_i=
-\begin{bmatrix}
-p_{x,\mathrm{rel},i} \\
-p_{y,\mathrm{rel},i} \\
-v_{x,\mathrm{rel},i} \\
-v_{y,\mathrm{rel},i}
-\end{bmatrix}
-$$
-
-미래 정답 위치도 같은 원점과 회전행렬을 사용한다.
-
-### 2.3 정규화와 데이터 분할
-
-입력과 출력에는 서로 다른 `MinMaxScaler`를 적용하여 각 값을 $[-1,1]$ 범위로 정규화하였다.
-데이터를 `train`, `validation`,`test` 각각 80:10:10을 데이터를 분할하였다.
-
-### 2.4 학습 및 평가
-
-데이터 학습 따로 ipynb 파일을 만들어 구글 코랩에서 진행하였다
-밑에 그래프는 train-validation 차이와 lstm이 예측한 경로와 실제경로의 오차를 그래프로 나타내었다
-
-<table>
-  <tr>
-    <td width="50%">
-      <img src="docs/images/train-validation-loss.png" width="100%">
-    </td>
-    <td width="50%">
-      <img src="docs/images/test-trajectory-prediction.png" width="100%">
-    </td>
-  </tr>
-</table>
-
-과적합 없이 훈련이 잘된 것을 알수있다.
-
-## 3. MPC 요격 제어
-
-### 3.1 요격체 운동모델
-
-MPC에서 사용하는 요격체 상태와 제어입력은 다음과 같다.
-
-$$
-\mathbf{x}_k=
-\begin{bmatrix}
-p_{x,k} \\
-p_{y,k} \\
-\psi_k
-\end{bmatrix},
-\qquad
-u_k=a_{\mathrm{lat},k}
-$$
-
-요격체 속력 $v$는 일정하다고 가정하였을때 이산 비선형 운동모델은 다음과 같다.
-
-$$
-\begin{aligned}
-\psi_{k+1}
-&=\psi_k+\frac{u_k}{v}\Delta t, \\
-p_{x,k+1}
-&=p_{x,k}+v\cos\psi_{k+1}\Delta t, \\
-p_{y,k+1}
-&=p_{y,k}+v\sin\psi_{k+1}\Delta t.
-\end{aligned}
-$$
-
-따라서 상태방정식은 다음과 같다.
-
-$$
-\mathbf{x}_{k+1}=f(\mathbf{x}_k,u_k)
-$$
-
-### 3.2 운동모델 선형화
-
-운동모델에는 $\sin$과 $\cos$이 포함되어 있으므로 기준 상태 $\bar{\mathbf{x}}_k$와 기준 입력 $\bar{u}_k$ 주변에서 매 스텝 선형화한다.
-
-1차 Taylor 전개는 다음과 같다.
-
-$$
-f(\mathbf{x}_k,u_k)
+\mathbf{x}_{k+1}
 \approx
-f(\bar{\mathbf{x}}_k,\bar{u}_k)
-+A_k(\mathbf{x}_k-\bar{\mathbf{x}}_k)
-+B_k(u_k-\bar{u}_k)
-$$
-
-이를 정리하면 다음과 같은 식을 얻을 수 있다.
-
-$$
-\boxed{
-\mathbf{x}_{k+1} =
-A_k\mathbf{x}_k+B_ku_k+d_k
-}
-$$
-
-기준점에서의 다음 방향각을 다음과 같이 정의한다.
-
-$$
-\theta_k =
-\bar{\psi}_k
+\mathbf{A}_k\mathbf{x}_k
 +
-\frac{\bar{u}_k}{v}\Delta t
+\mathbf{B}_k\mathbf{u}_k
++
+\mathbf{E}_k\mathbf{d}_k
++
+\mathbf{c}_k
 $$
 
-Jacobian 행렬은 다음과 같다.
+이를 예측 지평 전체에 누적하면 다음과 같이 나타낼 수 있다.
 
 $$
-A_k=
-\begin{bmatrix}
-1 & 0 & -v\Delta t\sin\theta_k \\
-0 & 1 & v\Delta t\cos\theta_k \\
-0 & 0 & 1
-\end{bmatrix}
+\mathbf{X}
+=
+\mathbf{S}\mathbf{U}
++
+\mathbf{T}\mathbf{x}_0
++
+\mathbf{h}
 $$
 
-$$
-B_k=
-\begin{bmatrix}
--\Delta t^{2}\sin\theta_k \\
-\Delta t^{2}\cos\theta_k \\
-\Delta t/v
-\end{bmatrix}
-$$
-
-위에 선형화 식을 정리하면 $d_k$는 다음과 같다
-
-$$
-d_k =
-f(\bar{\mathbf{x}}_k,\bar{u}_k)
--A_k\bar{\mathbf{x}}_k
--B_k\bar{u}_k
-$$
-
-### 3.3 기준 궤적과 예측행렬
-
-첫 MPC 계산에서는 선형화의 기준입력 기준 입력 $\bar{u}_k$을 0으로 정의한다
-
-$$
-\bar U = \left[0,\ 0,\ \ldots,\ 0\right]^{T}
-$$
-
-이후 계산에서는 직전 QP 해를 한 칸 이동하여 다음 선형화의 기준 입력으로 사용한다.
-
-$$
-\bar U = \left[u_{1,\mathrm{opt}},\ u_{2,\mathrm{opt}},\ \ldots,\ u_{N-1,\mathrm{opt}},\ u_{N-1,\mathrm{opt}}\right]^{T}
-$$
-
-기준 입력을 비선형 운동모델에 적용하여 기준 상태 궤적을 구하고, 각 예측 지점에서 $A_k$, $B_k$, $d_k$를 계산한다.
-
-미래 상태를 하나의 벡터로 쌓으면 다음과 같다.
-
-$$
-\mathbf{X}=
-\begin{bmatrix}
-\mathbf{x}_1 \\
-\mathbf{x}_2 \\
-\vdots \\
-\mathbf{x}_N
-\end{bmatrix}
-$$
-
-각 시점의 선형모델을 반복하여 대입하면 미래 상태를 다음과 같이 나타낼 수 있다.
-
-$$
-\boxed{
-\mathbf{X}=SU+T\mathbf{x}_0+t
-}
-$$
-
-### 3.4 기준 궤적과 가중행렬
-
-LSTM이 예측한 미래 절대 위치 20개를 MPC 기준 궤적으로 사용한다.
-
-$$
-\mathbf{X}_{\mathrm{ref}}=
-\begin{bmatrix}
-p_{x,1}^{\mathrm{target}} \\
-p_{y,1}^{\mathrm{target}} \\
-0 \\
-\vdots \\
-p_{x,N}^{\mathrm{target}} \\
-p_{y,N}^{\mathrm{target}} \\
-0
-\end{bmatrix}
-$$
-
-전체 가중행렬은 다음과 같다.
-
-$$
-\bar Q =
-\mathrm{blkdiag}
-\left(
-Q,\ldots,Q,Q_N
-\right)
-$$
-
-$$
-\bar R =
-I_N\otimes R
-$$
-
-### 3.5 비용함수
-
-MPC 비용함수는 미래 위치 오차와 제어입력 크기의 가중합으로 정의한다.
-중간 비용함수의 가중치를 Q=(1,1,0)로 정의하였고 qn=(20,20,0)으로 정의하여 유도를 정확히 하기 위해서 중간 비용 가중치보다 크게 정의하였다.
+이 식을 각 방식의 이차 비용함수에 대입하여 다음의 이차계획법(QP) 문제를 구성하였다.
 
 $$
 \begin{aligned}
-J(U)
-=&
-\frac{1}{2}
-\sum_{k=1}^{N-1}
-(\mathbf{x}_k-\mathbf{r}_k)^{T}
-Q
-(\mathbf{x}_k-\mathbf{r}_k) \\
-&+
-\frac{1}{2}
-(\mathbf{x}_N-\mathbf{r}_N)^{T}
-Q_N
-(\mathbf{x}_N-\mathbf{r}_N) \\
-&+
-\frac{1}{2}
-\sum_{k=0}^{N-1}
-u_k^{T}Ru_k.
+\min_{\mathbf{U}}
+\quad&
+\frac{1}{2}\mathbf{U}^{\top}\mathbf{P}\mathbf{U}
++
+\mathbf{q}^{\top}\mathbf{U}
+\\
+\mathrm{subject\ to}
+\quad&
+-\frac{u_{\max}}{\sqrt{2}}
+\leq
+u_{k,i}
+\leq
+\frac{u_{\max}}{\sqrt{2}}
 \end{aligned}
 $$
 
-이를 쌓은 행렬로 표현하면 다음과 같다.
+## 4. A 방식 — 가속도 외란 MPC
+
+예측된 표적 가속도를 선형화된 상태방정식의 외란으로 넣는다. 예측 길이가
+MPC 지평보다 짧으므로 나머지는 0으로 채운다.
 
 $$
-J(U) =
-\frac{1}{2}
-(\mathbf{X}-\mathbf{X}_{\mathrm{ref}})^{T}
-\bar Q
-(\mathbf{X}-\mathbf{X}_{\mathrm{ref}})
-+
-\frac{1}{2}U^{T}\bar R U
-$$
-
-### 3.6 QP 변환
-
-상태예측식 $\mathbf{X}=SU+T\mathbf{x}_0+t$를 비용함수에 대입한다. 다음 오차 벡터를 정의하면:
-
-$$
-e =
-T\mathbf{x}_0+t-\mathbf{X}_{\mathrm{ref}}
-$$
-
-미래 상태 오차는 다음과 같다.
-
-$$
-\mathbf{X}-\mathbf{X}_{\mathrm{ref}}
-=SU+e
-$$
-
-비용함수를 전개하여 제어입력 $U$와 무관한 상수항을 제거하면 다음 표준 QP 형태를 얻는다.
-
-$$
-\boxed{
-\min_U
-\frac{1}{2}U^{T}PU+q^{T}U
-}
-$$
-
-여기서 QP 행렬은 다음과 같다.
-
-$$
-\boxed{
-P=S^{T}\bar Q S+\bar R
-}
+\mathbf d_k=\begin{cases}\hat{\mathbf a}_{t+k}, & k<8\\[2pt] \mathbf 0, & 8\le k<N\end{cases}
 $$
 
 $$
-\boxed{
-q=S^{T}\bar Q
-\left(
-T\mathbf{x}_0+t-\mathbf{X}_{\mathrm{ref}}
-\right)
-}
+\mathbf x_{k+1}=\mathbf A_k\mathbf x_k+\mathbf B_k\mathbf u_k+\mathbf c_k+\mathbf E\,\mathbf d_k
 $$
 
-요격체 최대 횡가속도는 다음 제약조건으로 적용한다.
+유도 목표는 시선각속도를 0으로 만드는
+것이다. $\hat{\boldsymbol\lambda}$ 를 시선(LOS) 단위벡터라 할 때, 상대속도의
+LOS 수직 성분은
 
 $$
--u_{\max}\mathbf{1}
-\le U\le
-u_{\max}\mathbf{1}
+\mathbf v_\perp=\mathbf v_{\mathrm{rel}}-(\mathbf v_{\mathrm{rel}}\cdot\hat{\boldsymbol\lambda})\,\hat{\boldsymbol\lambda}
 $$
 
 $$
-u_{\max}=g_{\max}\times9.81
+\min_{\mathbf U}\ \
+\frac{1}{\sigma^2}\sum_{k=1}^{N}\lVert\mathbf v_{\perp,k}\rVert^2
++\frac{w_r}{r_0^{2}}\lVert\mathbf p_{\mathrm{rel},N}\rVert^{2}
++\frac{w_u}{u_{\max}^{2}}\sum_k\lVert\mathbf u_k\rVert^{2}
++\frac{w_{\Delta}}{u_{\max}^{2}}\sum_k\lVert\mathbf u_k-\mathbf u_{k-1}\rVert^{2}
 $$
 
-QP는 `qpsolvers`의 `quadprog` solver를 사용하여 계산한다.
+제약은 $\lVert\mathbf u_k\rVert_\infty\le u_{\max}/\sqrt2$ 이며, 두 축을 동시에
+써도 합성 가속도가 $20g$ 를 넘지 않게 한다.
 
-```python
-U = solve_qp(
-    P,
-    q,
-    lb=u_min,
-    ub=u_max,
-    solver="quadprog",
-)
-```
+가중치는 $\sigma=20\ \mathrm{m/s}$, $w_r=20$, $w_u=0.02$, $w_\Delta=0.05$로 설정하였다.
 
-### 3.7 Receding horizon
+## 5. B 방식 — 위치 요격 MPC
 
-QP로 계산한 최적 제어입력 시퀀스는 다음과 같다.
+궤적을 추종하는 대신, 언제 요격이 가능한지를 먼저 풀고 그 한 점을 조준한다.
+
+1단계 — 요격 시점 탐색. 요격체의 이동 가능 거리 안에 들어오는 가장 빠른
+예측 인덱스를 고른다.
 
 $$
-U_{\mathrm{opt}} = \left[u_{0,\mathrm{opt}},\ u_{1,\mathrm{opt}},\ \ldots,\ u_{N-1,\mathrm{opt}}\right]^{T}
+j_{\mathrm{hit}}=\min\Big\{\,j\ :\ \lVert\hat{\mathbf p}_{t+j}-\mathbf p^{\,\mathrm{int}}_t\rVert\le V_{\mathrm{int}}\,j\,\Delta t+r_{\mathrm{hit}}\,\Big\}
 $$
 
-실제 요격체에는 첫 번째 입력만 적용한다.
+실제로는 후보 인덱스를 성긴 간격에서 촘촘한 간격으로 좁혀가며 탐색하고, 각
+후보마다 작은 종말 오차 QP를 풀어 도달 가능성을 검증한다.
+
+2단계 — 조준. 단계 가중치를 그 한 인덱스에 거의 전부 몰아준다.
 
 $$
-u_{\mathrm{applied}} = u_{0,\mathrm{opt}}
+\min_{\mathbf U}\ \
+w_{\mathrm{hit}}\lVert\mathbf p_{j_{\mathrm{hit}}}-\hat{\mathbf p}_{t+j_{\mathrm{hit}}}\rVert^{2}
++w_{\mathrm{track}}\!\!\sum_{k<j_{\mathrm{hit}}}\!\!\lVert\mathbf p_{k}-\hat{\mathbf p}_{t+k}\rVert^{2}
++\frac{w_u}{u_{\max}^{2}}\sum_k\lVert\mathbf u_k\rVert^{2}
 $$
 
-다음 제어주기에는 갱신된 미사일 상태와 새로운 LSTM 예측으로 같은 최적화 문제를 다시 계산한다.
+제약은 $\lVert\mathbf u_k\rVert_\infty\le u_{\max}/\sqrt2$ 이며, 두 축을 동시에
+써도 합성 가속도가 $20g$ 를 넘지 않게 한다.
 
-## 4.시뮬레이션 결과
-
-다음은 시뮬레이션 결과이다. 총 4번의 시뮬레이션을 하였고 모두 요격하는데 성공하였다.
-
-<table>
-  <tr>
-    <td width="50%">
-      <img src="docs/images/simulation-dynamic-01.png" width="100%">
-    </td>
-    <td width="50%">
-      <img src="docs/images/simulation-dynamic-02.png" width="100%">
-    </td>
-  </tr>
-  <tr>
-    <td width="50%">
-      <img src="docs/images/simulation-dynamic-03.png" width="100%">
-    </td>
-    <td width="50%">
-      <img src="docs/images/simulation-dynamic-04.png" width="100%">
-    </td>
-  </tr>
-</table>
-
-## 5. 문제점
-
-물체가 복잡하게 움직였을때 요격을 실패하거나 아니면 거친 원운동을 하여 요격을 하는 경우가 있음
+$w_{\mathrm{hit}}=200$, $w_{\mathrm{track}}=0.02$ 로 네 자릿수 차이다. 이
+비율 자체가 방법의 핵심이다 궤적은 약한 힌트일 뿐이고 요격점이 목적이다.

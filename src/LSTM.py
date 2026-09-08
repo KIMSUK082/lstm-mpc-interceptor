@@ -1,29 +1,38 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, MaxAbsScaler
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from sim import Sim
 import joblib
 from vehicle import Vehicle
+from pathlib import Path
 
 N_SIMS = 1000
 seq_length = 40
-target_length = 20
+target_length = 8
 input_size = 4
-output_size = 40
+output_size = 16
 hidden_size = 64
 batch_size = 64
 num_layers = 2
 epochs = 30
 lr = 0.0001
+dt = 0.05
 
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+MODEL_DIR = PROJECT_DIR / "model"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_PATH = MODEL_DIR / "lstm_model.pth"
+X_SCALER_PATH = MODEL_DIR / "x_scaler.pkl"
+Y_SCALER_PATH = MODEL_DIR / "y_scaler.pkl"
 
 ## lstm을 절대좌표로 학습시키면 절대좌표 그자체를 외워버리기에 학습률이 떨어짐
 ## 표적의 움직임을 반영하여 학습시키려면 상대위치 상대속도를 학습시켜야함 표적 현재시점을 기준으로
 ## 표적의 과거 위치를 상대위치로 변환 이러면 물체가 움직임만을 학습할수있음
-## 먼저 상대정규화후 -1~1로 minmax정규화 움직임은 음수도 포함하고 있어야함
+## 입력은 MinMaxScaler, 출력 종·횡가속도는 0과 부호를 보존하는 MaxAbsScaler 사용
 
 data_set = []
 
@@ -36,7 +45,7 @@ data_set = np.array(data_set)
 print(data_set.shape)
 
 
-def create_seqeunce(data, seq_length, target_length):
+def create_sequence(data, seq_length, target_length):
     sequences = []
     targets = []
     for i in tqdm(range(N_SIMS), desc="데이터 처리중"):
@@ -62,14 +71,37 @@ def create_seqeunce(data, seq_length, target_length):
             sequences.append(np.hstack((rel_pos, rel_vel)))
 
             ## target 구하기
-            delta_pos = future[:, 0:2] - current_pos
-            rel_pos = delta_pos @ R.T
-            targets.append(rel_pos)
+            future_vel = future[:, 2:]
+            velocity_sequence = np.vstack(
+                (
+                    current_vel,
+                    future_vel,
+                )
+            )
+            acceleration = np.diff(velocity_sequence, axis=0) / dt
+            start_velocities = velocity_sequence[:-1]
+            speed = np.linalg.norm(start_velocities, axis=1, keepdims=True)
+            speed = np.maximum(speed, 1e-8)
+
+            e_parallel = start_velocities / speed  ## 단위백터
+            e_perp = np.column_stack((-e_parallel[:, 1], e_parallel[:, 0]))
+
+            a_parallel = np.sum(acceleration * e_parallel, axis=1)
+            a_perp = np.sum(acceleration * e_perp, axis=1)
+
+            body_acceleration = np.column_stack(
+                (
+                    a_parallel,
+                    a_perp,
+                )
+            )
+
+            targets.append(body_acceleration)
 
     return np.array(sequences), np.array(targets)
 
 
-X, Y = create_seqeunce(data_set, seq_length, target_length)
+X, Y = create_sequence(data_set, seq_length, target_length)
 
 total_size = len(X)
 train_end = int(total_size * 0.8)
@@ -81,9 +113,9 @@ y_train, y_valid, y_test = Y[:train_end], Y[train_end:valid_end], Y[valid_end:]
 
 ## 스케일러를 다르게 두어 sequence와 target을 각각 정규화
 x_scaler = MinMaxScaler(feature_range=(-1, 1))
-y_scaler = MinMaxScaler(feature_range=(-1, 1))
+y_scaler = MaxAbsScaler()
 
-## minmaxscaler는 2차원 데이터밖에 못받음 그래서 reshape로 정규화후 scale
+## sklearn scaler는 2차원 데이터를 받으므로 reshape 후 정규화
 ## train data만 fit
 x_train_scaled = x_scaler.fit_transform(x_train.reshape(-1, 4)).reshape(x_train.shape)
 y_train_scaled = y_scaler.fit_transform(y_train.reshape(-1, 2)).reshape(y_train.shape)
@@ -95,8 +127,8 @@ x_test_scaled = x_scaler.transform(x_test.reshape(-1, 4)).reshape(x_test.shape)
 y_test_scaled = y_scaler.transform(y_test.reshape(-1, 2)).reshape(y_test.shape)
 
 
-joblib.dump(x_scaler, "x_scaler.pkl")
-joblib.dump(y_scaler, "y_scaler.pkl")
+joblib.dump(x_scaler, X_SCALER_PATH)
+joblib.dump(y_scaler, Y_SCALER_PATH)
 
 
 ## tensor화
@@ -132,10 +164,6 @@ test_loader = DataLoader(
 data_iter = iter(test_loader)
 sequences, targets = next(data_iter)
 
-# 2. 형태(Shape)나 값을 확인해봅니다.
-print("Sequence Shape:", sequences.shape)
-print("Target Shape:", targets.shape)
-
 
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size):
@@ -159,13 +187,12 @@ class LSTMModel(nn.Module):
         out = self.fc2(out)
         ## mlp는 데이터를 펼쳐서 줘야하고 출력값도 펼쳐서 나옴
         ## batch size가 꼭 64가 아닐수 있음 x.size는 그당시에 batchsize
-        out = out.reshape(x.size(0), 20, 2)
+        out = out.reshape(x.size(0), target_length, 2)
 
         return out
 
 
 model = LSTMModel(input_size, hidden_size, num_layers, output_size)
-model.load_state_dict(torch.load("lstm_model.pth", map_location=torch.device("cpu")))
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -202,3 +229,6 @@ for epoch in range(epochs):
         print(f"Validation Loss: {val_loss:.7f}")
 
     model.train()
+
+torch.save(model.state_dict(), MODEL_PATH)
+print(f"학습된 모델 저장 완료: {MODEL_PATH}")

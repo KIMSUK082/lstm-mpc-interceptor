@@ -23,10 +23,11 @@ def main():
         target,
         missile,
         T_max=45.0,
-        seed=12,
         predictor=predictor,
         mpc=mpc,
         observation_time=2.0,
+        maneuver_profile="dynamic",
+        seed=36,
     )
     traj_m, traj_p, predictions = sim.simulation()
     sim.plot_traj(traj_m, traj_p, predictions)

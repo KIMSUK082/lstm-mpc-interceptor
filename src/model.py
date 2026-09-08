@@ -1,18 +1,33 @@
-import torch.nn as nn
-import torch
+from pathlib import Path
+
 import joblib
 import numpy as np
-from pathlib import Path
+import torch
+import torch.nn as nn
+
 
 MODEL_DIR = Path(__file__).resolve().parent.parent / "model"
 
 
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size):
+    def __init__(
+        self,
+        input_size,
+        hidden_size,
+        num_layers,
+        output_size,
+        target_length=8,
+    ):
         super(LSTMModel, self).__init__()
-        self.hidden_size = hidden_size  ## lstm의 ht와 cellstate의 값의 개수
+        self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.target_length = target_length
+        self.lstm = nn.LSTM(
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+        )
         self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(hidden_size // 2, output_size)
@@ -27,11 +42,7 @@ class LSTMModel(nn.Module):
         out = self.fc1(out)
         out = self.relu(out)
         out = self.fc2(out)
-        ## mlp는 데이터를 펼쳐서 줘야하고 출력값도 펼쳐서 나옴
-        ## batch size가 꼭 64가 아닐수 있음 x.size는 그당시에 batchsize
-        out = out.reshape(x.size(0), 20, 2)
-
-        return out
+        return out.reshape(x.size(0), self.target_length, 2)
 
 
 class TargetPredictor:
@@ -43,54 +54,57 @@ class TargetPredictor:
         input_size=4,
         hidden_size=64,
         num_layers=2,
-        output_size=40,
+        output_size=16,
+        target_length=8,
     ):
+        self.target_length = target_length
         self.x_scaler = joblib.load(x_scaler_path)
         self.y_scaler = joblib.load(y_scaler_path)
-
-        self.model = LSTMModel(input_size, hidden_size, num_layers, output_size)
+        self.model = LSTMModel(
+            input_size,
+            hidden_size,
+            num_layers,
+            output_size,
+            target_length,
+        )
         self.model.load_state_dict(
             torch.load(model_path, map_location=torch.device("cpu"))
         )
         self.model.eval()
 
-    def to_absolute(self, rel_pred, current_pos, current_vel):
+    def to_global_acceleration(self, relative_acceleration, current_vel):
         heading = np.arctan2(current_vel[1], current_vel[0])
-        R = np.array(
+        rotation = np.array(
             [
                 [np.cos(heading), np.sin(heading)],
                 [-np.sin(heading), np.cos(heading)],
             ]
         )
-        ## 상대좌표를 절대좌표로 변환
-        return rel_pred @ R + current_pos
+        return relative_acceleration @ rotation
 
     def predict(self, history):
-        hist = np.array(history)
-        current_pos = hist[-1, 0:2]
-        current_vel = hist[-1, 2:]
+        history = np.asarray(history, dtype=float)
+        current_pos = history[-1, 0:2]
+        current_vel = history[-1, 2:4]
         heading = np.arctan2(current_vel[1], current_vel[0])
-        R = np.array(
+        rotation = np.array(
             [
                 [np.cos(heading), np.sin(heading)],
                 [-np.sin(heading), np.cos(heading)],
             ]
         )
-
-        ## LSTM.py의 create_seqeunce와 동일한 상대좌표 변환
-        delta_pos = hist[:, 0:2] - current_pos
-        rel_pos = delta_pos @ R.T
-        rel_vel = hist[:, 2:] @ R.T
-        seq = np.hstack((rel_pos, rel_vel))
-
-        seq_scaled = self.x_scaler.transform(seq).reshape(1, 40, 4)
-        seq_tensor = torch.tensor(seq_scaled, dtype=torch.float32)
-
+        delta_pos = history[:, 0:2] - current_pos
+        relative_pos = delta_pos @ rotation.T
+        relative_vel = history[:, 2:4] @ rotation.T
+        sequence = np.hstack((relative_pos, relative_vel))
+        scaled_sequence = self.x_scaler.transform(sequence).reshape(1, 40, 4)
+        sequence_tensor = torch.tensor(scaled_sequence, dtype=torch.float32)
         with torch.no_grad():
-            pred_scaled = self.model(seq_tensor)  # (1, 20, 2)
-
-        pred_rel = self.y_scaler.inverse_transform(
-            pred_scaled.numpy().reshape(-1, 2)
-        ).reshape(20, 2)
-
-        return self.to_absolute(pred_rel, current_pos, current_vel)
+            scaled_prediction = self.model(sequence_tensor)
+        relative_acceleration = self.y_scaler.inverse_transform(
+            scaled_prediction.numpy().reshape(-1, 2)
+        ).reshape(self.target_length, 2)
+        return self.to_global_acceleration(
+            relative_acceleration,
+            current_vel,
+        )
