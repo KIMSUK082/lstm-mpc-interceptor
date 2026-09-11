@@ -1,30 +1,8 @@
-"""A/B study: acceleration-prediction MPC vs position-prediction MPC.
 
-Runs the same scenario over many seeds, caches one pickle per seed, and
-draws the comparison figures from them.
-
-Self-contained on purpose: it defines its own scenario and never imports
-main.py, so the single-run demo and this experiment can change
-independently.  The scenario is written into every output, so a drift
-between the two files shows up in the report rather than silently.
-
-Three stages:
-
-    sweep     run the seeds in parallel, one pickle each (cached - a seed
-              that already has a pickle is not recomputed)
-    timing    re-run a few seeds single-process, because a solve time
-              measured under eight competing workers is inflated ~4x
-    figures   read the pickles and draw G1-G5
-
-    python ab_comparison.py                     all three
-    python ab_comparison.py --skip-sweep        redraw from the cached pickles
-    python ab_comparison.py --count 50          use fifty seeds
-"""
 
 import os
 
-## Thread pinning has to happen before numpy or torch is imported, both for
-## the workers and for the single-process timing stage.
+
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -52,14 +30,9 @@ from vehicle import Vehicle
 torch.set_num_threads(1)
 
 
-## ------------------------------------------------------------------ scenario
-
 SCENARIO = {
-    ## _sym: both methods bound each control axis at u_max / sqrt(2), the
-    ## square inscribed in the 20 g circle.  Earlier runs under the name
-    ## "aggressive_v300" let method B use u_max per axis and clipped the
-    ## resultant afterwards, which gave B 41 % more single-axis authority
-    ## than A.  Those pickles are kept for the before/after comparison.
+
+
     "name": "aggressive_v300_sym",
     "dt": 0.05,
     "T_max": 45.0,
@@ -75,7 +48,7 @@ SCENARIO = {
     "launch_point": (0.0, 0.0, 300.0),
 }
 
-## Seeds 0-999 trained both LSTMs, so evaluation must start above them.
+
 FIRST_EVALUATION_SEED = 1000
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -86,13 +59,10 @@ TIMING_PATH = RESULT_DIR / "timing.json"
 METRICS_PATH = RESULT_DIR / "ab_metrics.csv"
 REPORT_PATH = RESULT_DIR / "AB_REPORT.md"
 
-## The engagement behind the two single-run figures: both methods intercept,
-## the flight is long enough to read as a time series, and B spends half of it
-## against the acceleration limit.
+
 EXAMPLE_SEED = 10011
 
-## Defaults for a run.  Edit these to change the study size; the matching
-## command-line flags override them for a one-off run.
+
 START_SEED = 10000
 SEED_COUNT = 30
 WORKERS = 8
@@ -117,7 +87,7 @@ def build_target():
 
 
 def build_missile(target):
-    """Launch from the fixed point, pointed straight at the target."""
+
     launch = np.array(SCENARIO["launch_point"], dtype=float)
     relative = target.get_state()[0:3] - launch
 
@@ -136,10 +106,8 @@ def build_missile(target):
 
 
 def run_comparison(seed):
-    """One seed: both methods flown against a single shared target path.
 
-    Pure - it returns the result and writes nothing.
-    """
+
     dt = SCENARIO["dt"]
     radius = SCENARIO["intercept_radius"]
     max_g = SCENARIO["pursuer_max_g"]
@@ -187,9 +155,6 @@ def run_comparison(seed):
     return result
 
 
-## -------------------------------------------------------------- stage: sweep
-
-
 def evaluate_seed(seed, recompute):
     path = seed_path(seed)
 
@@ -227,12 +192,12 @@ def sweep(seeds, workers, recompute):
         for future in progress:
             seed = futures[future]
 
-            ## One unsolvable seed must not throw away the rest of the sweep.
+
             try:
                 future.result()
             except Exception as error:
                 failed.append((seed, error))
-                ## tqdm.write keeps the bar intact instead of tearing it.
+
                 progress.write(
                     f"[sweep] seed {seed} FAILED - "
                     f"{type(error).__name__}: {error}"
@@ -249,15 +214,9 @@ def sweep(seeds, workers, recompute):
             print(f"[sweep]   seed {seed}: {error}")
 
 
-## ------------------------------------------------------------- stage: timing
-
-
 def timing(seeds):
-    """Solve time measured one process at a time.
 
-    The sweep runs eight workers over twelve cores, which inflates every
-    per-step time roughly fourfold.  G1 quotes this stage instead.
-    """
+
     rows = []
 
     print(f"[timing] {len(seeds)} seeds, single process")
@@ -306,9 +265,6 @@ def timing(seeds):
     return summary
 
 
-## ---------------------------------------------------------------- figures
-
-
 LABELS = {
     "acceleration": "A. Acceleration prediction",
     "position": "B. Position prediction",
@@ -316,8 +272,7 @@ LABELS = {
 SHORT = {"acceleration": "A", "position": "B"}
 METHODS = ("acceleration", "position")
 
-## Validated categorical slots 1 and 2 on a light surface: worst-pair CVD
-## separation 24.7, well clear of the 8.0 floor.
+
 COLORS = {"acceleration": "#2a78d6", "position": "#eb6834"}
 MARKERS = {"acceleration": "o", "position": "s"}
 
@@ -328,7 +283,7 @@ INK_MUTED = "#8a8984"
 TRUTH = "#3d3d3a"
 
 G = 9.81
-COLUMN_INCHES = 10.87  # 27.6 cm
+COLUMN_INCHES = 10.87
 
 
 def apply_style():
@@ -368,7 +323,7 @@ def recess(axis):
 
 
 def save_png(figure, directory, name):
-    """Create the output directory if needed and write one PNG."""
+
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
@@ -379,11 +334,8 @@ def save_png(figure, directory, name):
     return path
 
 
-## ------------------------------------------------------------------ metrics
-
-
 def prediction_errors(result, key):
-    """Forecast entry j made at step k describes step k + j + 1."""
+
     truth = np.asarray(result["target_trajectory"], dtype=float)[:, 0:3]
     predictions = result[key]["predictions"]
     horizon = len(predictions[0])
@@ -459,9 +411,6 @@ def method_rows(results, scenario):
             )
 
     return rows
-
-
-## ------------------------------------------------------------------ figures
 
 
 def figure_computation(timing_summary, directory):
@@ -571,12 +520,8 @@ def figure_control_effort(result, seed, scenario, directory):
 
 
 def pick_prediction_step(result):
-    """A moment where the target is actually manoeuvring, mid-flight.
 
-    A method stops forecasting once it has intercepted, so its later
-    entries are None.  Only steps where both methods still predict can be
-    compared.
-    """
+
     commands = np.asarray(result["target_control_history"], dtype=float)
     acceleration = result["acceleration"]["predictions"]
     position = result["position"]["predictions"]
@@ -599,7 +544,7 @@ def pick_prediction_step(result):
             "No step has a forecast from both methods."
         )
 
-    ## Skip the opening dive, where the target has barely manoeuvred yet.
+
     candidates = usable[int(0.25 * len(usable)) :] or usable
     lateral = np.linalg.norm(commands[candidates, 1:3], axis=1)
 
@@ -624,8 +569,8 @@ def figure_prediction_example(result, seed, scenario, directory):
 
     for index, name in enumerate(("X", "Y", "Z")):
         axis = axes[index]
-        ## A tracks the truth closely enough to vanish under a thin line, so
-        ## the truth is drawn as a wide band underneath instead.
+
+
         axis.plot(
             lookahead,
             truth[:, index],
@@ -728,7 +673,7 @@ def figure_prediction_error(results, scenario, directory):
             color=COLORS[key],
         )
 
-    ## Without this reference, "5.9 m" carries no sense of scale.
+
     step_travel = scenario["target_speed"] * dt
     axis.axhline(step_travel, color=INK_MUTED, linestyle=":", linewidth=2.0)
     axis.annotate(
@@ -822,9 +767,6 @@ def figure_outcome(results, scenario, directory):
     return save_png(figure, directory, "G5_outcome.png")
 
 
-## ------------------------------------------------------------------- tables
-
-
 def write_metrics_csv(rows, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -885,11 +827,7 @@ def write_report(results, rows, timing_summary, scenario, path):
         f"| {timing_summary['position_ms_per_step_median']:.2f} ms |",
     ]
 
-    ## JSON turns the tuples in the scenario into lists, so compare both
-    ## sides after the same round trip.
-    ## Both sides go through the same round trip: a summary just produced in
-    ## memory still holds tuples, while one read back from the file holds
-    ## lists, and those must not read as a drift.
+
     recorded = json.loads(json.dumps(timing_summary.get("scenario")))
     current = json.loads(json.dumps(scenario))
 
@@ -910,9 +848,6 @@ def write_report(results, rows, timing_summary, scenario, path):
     return path
 
 
-## -------------------------------------------------------------------- entry
-
-
 def render_all(
     results,
     example_seed,
@@ -922,7 +857,7 @@ def render_all(
     metrics_path,
     report_path,
 ):
-    """Draw G1-G5 and write the two tables."""
+
     apply_style()
     example = results[example_seed]
 
@@ -935,9 +870,6 @@ def render_all(
     rows = method_rows(results, scenario)
     write_metrics_csv(rows, metrics_path)
     write_report(results, rows, timing_summary, scenario, report_path)
-
-
-## --------------------------------------------------------------------- entry
 
 
 def load_results(seeds):

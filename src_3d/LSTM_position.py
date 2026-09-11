@@ -9,7 +9,7 @@ from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from model import LSTMModel, local_basis
+from model import PositionLSTMModel, local_basis
 from sim import Sim
 from vehicle import Vehicle
 
@@ -42,33 +42,6 @@ def generate_dataset(number_of_simulations, duration):
         data_set.append(sim.dataset_sim())
 
     return np.asarray(data_set, dtype=np.float32)
-
-
-def local_basis(velocity):
-    velocity = np.asarray(velocity, dtype=float)
-    speed = max(np.linalg.norm(velocity), 1e-8)
-
-    forward = velocity / speed
-    world_up = np.array([0.0, 0.0, 1.0])
-
-    side = np.cross(world_up, forward)
-    side_norm = np.linalg.norm(side)
-
-    if side_norm < 1e-8:
-        reference = np.array([0.0, 1.0, 0.0])
-        side = np.cross(reference, forward)
-        side_norm = np.linalg.norm(side)
-
-    side = side / max(side_norm, 1e-8)
-    vertical = np.cross(forward, side)
-
-    return np.vstack(
-        (
-            forward,
-            vertical,
-            side,
-        )
-    )
 
 
 def create_sequence(
@@ -221,7 +194,7 @@ def train(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = LSTMModel(
+    model = PositionLSTMModel(
         input_size=6,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,

@@ -376,6 +376,21 @@ class ComparisonAnimation:
                 )[:, :3]
             )
 
+        position_method = self.result["position"]
+        hit_points = []
+
+        for frame in range(len(self.target)):
+            hit_point = self.hit_point_for_frame(
+                position_method,
+                frame,
+            )
+
+            if hit_point is not None:
+                hit_points.append(hit_point)
+
+        if hit_points:
+            positions.append(np.asarray(hit_points, dtype=float))
+
         positions = np.vstack(positions)
         x_limits = self.padded_limits(positions[:, 0])
         y_limits = self.padded_limits(positions[:, 1])
@@ -458,7 +473,9 @@ class ComparisonAnimation:
                 linestyle="None",
                 color="#F2A900",
                 markeredgecolor="#6B4E00",
-                markersize=12,
+                markeredgewidth=1.2,
+                markersize=18,
+                zorder=20,
                 label=(
                     "Predicted intercept point"
                     if key == "position"
@@ -547,6 +564,44 @@ class ComparisonAnimation:
             origin = self.target[frame, :3]
 
         return np.vstack((origin, prediction[:, :3]))
+
+    def hit_point_for_frame(self, method, frame, prediction=None):
+        hit_point = self.item_for_frame(
+            method.get("hit_points"),
+            frame,
+        )
+
+        if hit_point is not None:
+            hit_point = np.asarray(hit_point, dtype=float).reshape(-1)
+
+            if hit_point.size >= 3 and np.all(np.isfinite(hit_point[:3])):
+                return hit_point[:3]
+
+        hit_step = self.item_for_frame(
+            method.get("hit_steps"),
+            frame,
+        )
+
+        if hit_step is None:
+            return None
+
+        if prediction is None:
+            prediction = self.prediction_for_frame(method, frame)
+
+        if prediction is None:
+            return None
+
+        hit_index = int(hit_step)
+
+        if hit_index < 1 or hit_index >= len(prediction):
+            return None
+
+        hit_point = np.asarray(prediction[hit_index, :3], dtype=float)
+
+        if not np.all(np.isfinite(hit_point)):
+            return None
+
+        return hit_point
 
     def display_time(self, frame, method):
         intercept_time = method["intercept_time"]
@@ -695,13 +750,15 @@ class ComparisonAnimation:
                 prediction,
             )
 
-        hit_point = None
-
-        if key == "position":
-            hit_point = self.item_for_frame(
-                method.get("hit_points"),
+        hit_point = (
+            self.hit_point_for_frame(
+                method,
                 sample_frame,
+                prediction,
             )
+            if key == "position"
+            else None
+        )
 
         if hit_point is None:
             artists["hit_marker"].set_data([], [])
