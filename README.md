@@ -122,7 +122,7 @@ $$
 이 식을 각 방식의 이차 비용함수에 대입하여 다음의 이차계획법(QP) 문제를 구성하였다.
 
 $$
-\underset{\mathbf U}{\operatorname{minimize}}
+\min_{\mathbf U}
 \quad
 \frac{1}{2}\mathbf U^{\top}\mathbf P\mathbf U
 +\mathbf q^{\top}\mathbf U.
@@ -175,7 +175,7 @@ $$
 $$
 
 $$
-\underset{\mathbf U}{\operatorname{minimize}}
+\min_{\mathbf U}
 \quad
 \frac{1}{\sigma^2}\sum_{k=1}^{N}\lVert\mathbf v_{\perp,k}\rVert^2
 +\frac{w_r}{r_0^2}\lVert\mathbf p_{\mathrm{rel},N}\rVert^2
@@ -212,7 +212,7 @@ $$
 2단계 — 조준. 단계 가중치를 그 한 인덱스에 거의 전부 몰아준다.
 
 $$
-\underset{\mathbf U}{\operatorname{minimize}}
+\min_{\mathbf U}
 \quad
 w_{\mathrm{hit}}
 \left\lVert
