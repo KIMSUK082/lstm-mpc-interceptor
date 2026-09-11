@@ -1,5 +1,3 @@
-"""Optimized long-horizon position prediction and interception-time MPC."""
-
 from dataclasses import dataclass
 
 import numpy as np
@@ -176,42 +174,71 @@ class PositionInterceptionMPC:
     def linearize(self, state, control, speed):
         state = np.asarray(state, dtype=float)
         control = np.asarray(control, dtype=float)
+        control = self.limit_control(control)
+
+        dt = self.dt
+        speed = max(float(speed), 1e-6)
+        gamma = float(state[3])
+        heading = float(state[4])
+        vertical_acceleration = float(control[0])
+        side_acceleration = float(control[1])
+
+        cosine = np.cos(gamma)
+        safe_cosine = self.safe_cos(gamma)
+        safe_cosine_derivative = (
+            np.sin(gamma) / safe_cosine**2
+            if abs(cosine) >= 1e-3
+            else 0.0
+        )
+
+        raw_next_gamma = gamma + vertical_acceleration / speed * dt
+        gamma_limit = np.deg2rad(80.0)
+        gamma_active = float(-gamma_limit < raw_next_gamma < gamma_limit)
+
+        next_gamma = float(np.clip(raw_next_gamma, -gamma_limit, gamma_limit))
+        next_heading = self.wrap_angle(
+            heading + side_acceleration / (speed * safe_cosine) * dt
+        )
+
+        gamma_jacobian = np.array(
+            [
+                -np.sin(next_gamma) * np.cos(next_heading),
+                -np.sin(next_gamma) * np.sin(next_heading),
+                np.cos(next_gamma),
+            ]
+        )
+        heading_jacobian = np.array(
+            [
+                -np.cos(next_gamma) * np.sin(next_heading),
+                np.cos(next_gamma) * np.cos(next_heading),
+                0.0,
+            ]
+        )
+
+        next_gamma_gamma = gamma_active
+        next_gamma_vertical = gamma_active * dt / speed
+        next_heading_gamma = (
+            side_acceleration / speed * dt * safe_cosine_derivative
+        )
+        next_heading_side = dt / (speed * safe_cosine)
 
         A = np.zeros((5, 5))
         B = np.zeros((5, 2))
 
-        state_epsilon = np.array(
-            [
-                1e-3,
-                1e-3,
-                1e-3,
-                1e-6,
-                1e-6,
-            ]
+        A[:3, :3] = np.eye(3)
+        A[:3, 3] = speed * dt * (
+            gamma_jacobian * next_gamma_gamma
+            + heading_jacobian * next_heading_gamma
         )
-        control_epsilon = np.full(2, 1e-3)
+        A[:3, 4] = speed * dt * heading_jacobian
+        A[3, 3] = next_gamma_gamma
+        A[4, 3] = next_heading_gamma
+        A[4, 4] = 1.0
 
-        for index in range(5):
-            state_plus = state.copy()
-            state_minus = state.copy()
-            state_plus[index] += state_epsilon[index]
-            state_minus[index] -= state_epsilon[index]
-
-            A[:, index] = (
-                self.model(state_plus, control, speed)
-                - self.model(state_minus, control, speed)
-            ) / (2.0 * state_epsilon[index])
-
-        for index in range(2):
-            control_plus = control.copy()
-            control_minus = control.copy()
-            control_plus[index] += control_epsilon[index]
-            control_minus[index] -= control_epsilon[index]
-
-            B[:, index] = (
-                self.model(state, control_plus, speed)
-                - self.model(state, control_minus, speed)
-            ) / (2.0 * control_epsilon[index])
+        B[:3, 0] = speed * dt * gamma_jacobian * next_gamma_vertical
+        B[:3, 1] = speed * dt * heading_jacobian * next_heading_side
+        B[3, 0] = next_gamma_vertical
+        B[4, 1] = next_heading_side
 
         next_state = self.model(state, control, speed)
         affine = next_state - A @ state - B @ control
@@ -338,12 +365,6 @@ class PositionInterceptionMPC:
         if horizon in self.bound_cache:
             return self.bound_cache[horizon]
 
-        ## The physical limit is on the resultant, so the box is the square
-        ## inscribed in the circle of radius u_max.  Bounding each axis at
-        ## u_max instead would let the QP return up to sqrt(2) * u_max and
-        ## leave limit_control to clip it afterwards - the applied command
-        ## would then no longer be the solution the QP optimised.  Method A
-        ## uses the same bound.
         axis_limit = self.u_max / np.sqrt(2.0)
 
         lower_bound = np.full(
@@ -412,10 +433,6 @@ class PositionInterceptionMPC:
 
         self.qp_solve_count += 1
 
-        ## The endpoint Hessian is a Gram matrix whose entries reach ~1e6, so
-        ## the fixed 1e-8 ridge above is below rounding there and quadprog's
-        ## Cholesky can still reject it.  Treat that as an unsolved QP and let
-        ## the caller fall back, rather than killing the run.
         try:
             solution = solve_qp(
                 2.0 * hessian,

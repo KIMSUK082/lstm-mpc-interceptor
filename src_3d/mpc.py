@@ -1,18 +1,9 @@
-"""
-MPC algorithms used in the A/B comparison.
-
-AccelerationDisturbanceMPC is the acceleration-prediction method.
-PositionInterceptionMPC is imported at the bottom from mpc_position.py.
-"""
-
 import numpy as np
 from qpsolvers import solve_qp
 from mpc_position import PositionInterceptionMPC
 
 
 class AccelerationDisturbanceMPC:
-    """Use the short-term acceleration prediction as an MPC disturbance."""
-
     def __init__(
         self,
         dt=0.05,
@@ -61,19 +52,6 @@ class AccelerationDisturbanceMPC:
 
         return cos_angle
 
-    """
-        state:
-        [rx, ry, rz, target_v, target_gamma, target_heading,
-         pursuer_gamma, pursuer_heading]
-
-        control:
-        [pursuer_vertical_acceleration, pursuer_side_acceleration]
-
-        disturbance:
-        [target_parallel_acceleration, target_vertical_acceleration,
-         target_side_acceleration]
-    """
-
     def model(
         self,
         state,
@@ -101,7 +79,6 @@ class AccelerationDisturbanceMPC:
         pursuer_vertical = control[0]
         pursuer_side = control[1]
 
-        ## 표적의 다음 속력과 진행 방향
         next_target_speed = max(
             target_speed + target_parallel * self.dt,
             1e-6,
@@ -119,7 +96,6 @@ class AccelerationDisturbanceMPC:
             * self.dt
         )
 
-        ## 추적 물체의 다음 진행 방향
         safe_pursuer_speed = max(float(pursuer_speed), 1e-6)
 
         next_pursuer_gamma = (
@@ -137,7 +113,6 @@ class AccelerationDisturbanceMPC:
             * self.dt
         )
 
-        ## 새로운 속도와 방향으로 다음 속도 계산
         target_velocity = (
             next_target_speed
             * self.direction(
@@ -154,7 +129,6 @@ class AccelerationDisturbanceMPC:
             )
         )
 
-        ## 상대위치 = 표적 위치 - 추적 물체 위치
         next_relative_position = (
             relative_position
             + (target_velocity - pursuer_velocity) * self.dt
@@ -188,90 +162,163 @@ class AccelerationDisturbanceMPC:
         B = np.zeros((8, 2))
         E = np.zeros((8, 3))
 
-        state_epsilon = np.array(
+        dt = self.dt
+        target_speed_state = state[3]
+        target_speed = max(target_speed_state, 1e-6)
+        target_gamma = state[4]
+        target_heading = state[5]
+        pursuer_gamma = state[6]
+        pursuer_heading = state[7]
+
+        target_parallel = disturbance[0]
+        target_vertical = disturbance[1]
+        target_side = disturbance[2]
+        pursuer_vertical = control[0]
+        pursuer_side = control[1]
+
+        pursuer_speed = max(float(pursuer_speed), 1e-6)
+        target_cos = self.safe_cos(target_gamma)
+        pursuer_cos = self.safe_cos(pursuer_gamma)
+
+        target_cos_derivative = (
+            np.sin(target_gamma) / target_cos**2
+            if abs(np.cos(target_gamma)) >= 1e-3
+            else 0.0
+        )
+        pursuer_cos_derivative = (
+            np.sin(pursuer_gamma) / pursuer_cos**2
+            if abs(np.cos(pursuer_gamma)) >= 1e-3
+            else 0.0
+        )
+
+        current_speed_active = float(target_speed_state > 1e-6)
+        raw_next_target_speed = target_speed + target_parallel * dt
+        next_speed_active = float(raw_next_target_speed > 1e-6)
+        next_target_speed = max(raw_next_target_speed, 1e-6)
+
+        next_target_gamma = (
+            target_gamma + target_vertical / target_speed * dt
+        )
+        next_target_heading = (
+            target_heading + target_side / (target_speed * target_cos) * dt
+        )
+        next_pursuer_gamma = (
+            pursuer_gamma + pursuer_vertical / pursuer_speed * dt
+        )
+        next_pursuer_heading = (
+            pursuer_heading + pursuer_side / (pursuer_speed * pursuer_cos) * dt
+        )
+
+        target_direction = self.direction(
+            next_target_gamma,
+            next_target_heading,
+        )
+        target_gamma_jacobian = np.array(
             [
-                1e-3,
-                1e-3,
-                1e-3,
-                1e-3,
-                1e-6,
-                1e-6,
-                1e-6,
-                1e-6,
+                -np.sin(next_target_gamma) * np.cos(next_target_heading),
+                -np.sin(next_target_gamma) * np.sin(next_target_heading),
+                np.cos(next_target_gamma),
+            ]
+        )
+        target_heading_jacobian = np.array(
+            [
+                -np.cos(next_target_gamma) * np.sin(next_target_heading),
+                np.cos(next_target_gamma) * np.cos(next_target_heading),
+                0.0,
+            ]
+        )
+        pursuer_gamma_jacobian = np.array(
+            [
+                -np.sin(next_pursuer_gamma) * np.cos(next_pursuer_heading),
+                -np.sin(next_pursuer_gamma) * np.sin(next_pursuer_heading),
+                np.cos(next_pursuer_gamma),
+            ]
+        )
+        pursuer_heading_jacobian = np.array(
+            [
+                -np.cos(next_pursuer_gamma) * np.sin(next_pursuer_heading),
+                np.cos(next_pursuer_gamma) * np.cos(next_pursuer_heading),
+                0.0,
             ]
         )
 
-        control_epsilon = np.full(2, 1e-3)
-        disturbance_epsilon = np.full(3, 1e-3)
+        d_speed_next_d_speed = next_speed_active * current_speed_active
+        d_target_gamma_d_speed = (
+            -target_vertical * dt / target_speed**2 * current_speed_active
+        )
+        d_target_heading_d_speed = (
+            -target_side
+            * dt
+            / (target_speed**2 * target_cos)
+            * current_speed_active
+        )
+        d_target_heading_d_gamma = (
+            target_side / target_speed * dt * target_cos_derivative
+        )
+        d_pursuer_heading_d_gamma = (
+            pursuer_side / pursuer_speed * dt * pursuer_cos_derivative
+        )
 
-        ## A = df / dx
-        for index in range(8):
-            state_plus = state.copy()
-            state_minus = state.copy()
+        d_target_velocity_d_speed = (
+            d_speed_next_d_speed * target_direction
+            + next_target_speed
+            * (
+                target_gamma_jacobian * d_target_gamma_d_speed
+                + target_heading_jacobian * d_target_heading_d_speed
+            )
+        )
+        d_target_velocity_d_gamma = next_target_speed * (
+            target_gamma_jacobian
+            + target_heading_jacobian * d_target_heading_d_gamma
+        )
+        d_target_velocity_d_heading = (
+            next_target_speed * target_heading_jacobian
+        )
+        d_pursuer_velocity_d_gamma = pursuer_speed * (
+            pursuer_gamma_jacobian
+            + pursuer_heading_jacobian * d_pursuer_heading_d_gamma
+        )
+        d_pursuer_velocity_d_heading = (
+            pursuer_speed * pursuer_heading_jacobian
+        )
 
-            state_plus[index] += state_epsilon[index]
-            state_minus[index] -= state_epsilon[index]
+        A[0:3, 0:3] = np.eye(3)
+        A[0:3, 3] = dt * d_target_velocity_d_speed
+        A[0:3, 4] = dt * d_target_velocity_d_gamma
+        A[0:3, 5] = dt * d_target_velocity_d_heading
+        A[0:3, 6] = -dt * d_pursuer_velocity_d_gamma
+        A[0:3, 7] = -dt * d_pursuer_velocity_d_heading
+        A[3, 3] = d_speed_next_d_speed
+        A[4, 3] = d_target_gamma_d_speed
+        A[4, 4] = 1.0
+        A[5, 3] = d_target_heading_d_speed
+        A[5, 4] = d_target_heading_d_gamma
+        A[5, 5] = 1.0
+        A[6, 6] = 1.0
+        A[7, 6] = d_pursuer_heading_d_gamma
+        A[7, 7] = 1.0
 
-            A[:, index] = (
-                self.model(
-                    state_plus,
-                    control,
-                    pursuer_speed,
-                    disturbance,
-                )
-                - self.model(
-                    state_minus,
-                    control,
-                    pursuer_speed,
-                    disturbance,
-                )
-            ) / (2.0 * state_epsilon[index])
+        B[0:3, 0] = -dt**2 * pursuer_gamma_jacobian
+        B[0:3, 1] = -dt**2 / pursuer_cos * pursuer_heading_jacobian
+        B[6, 0] = dt / pursuer_speed
+        B[7, 1] = dt / (pursuer_speed * pursuer_cos)
 
-        ## B = df / du
-        for index in range(2):
-            control_plus = control.copy()
-            control_minus = control.copy()
-
-            control_plus[index] += control_epsilon[index]
-            control_minus[index] -= control_epsilon[index]
-
-            B[:, index] = (
-                self.model(
-                    state,
-                    control_plus,
-                    pursuer_speed,
-                    disturbance,
-                )
-                - self.model(
-                    state,
-                    control_minus,
-                    pursuer_speed,
-                    disturbance,
-                )
-            ) / (2.0 * control_epsilon[index])
-
-        ## E = df / dd
-        for index in range(3):
-            disturbance_plus = disturbance.copy()
-            disturbance_minus = disturbance.copy()
-
-            disturbance_plus[index] += disturbance_epsilon[index]
-            disturbance_minus[index] -= disturbance_epsilon[index]
-
-            E[:, index] = (
-                self.model(
-                    state,
-                    control,
-                    pursuer_speed,
-                    disturbance_plus,
-                )
-                - self.model(
-                    state,
-                    control,
-                    pursuer_speed,
-                    disturbance_minus,
-                )
-            ) / (2.0 * disturbance_epsilon[index])
+        E[0:3, 0] = dt**2 * next_speed_active * target_direction
+        E[0:3, 1] = (
+            dt**2
+            * next_target_speed
+            / target_speed
+            * target_gamma_jacobian
+        )
+        E[0:3, 2] = (
+            dt**2
+            * next_target_speed
+            / (target_speed * target_cos)
+            * target_heading_jacobian
+        )
+        E[3, 0] = dt * next_speed_active
+        E[4, 1] = dt / target_speed
+        E[5, 2] = dt / (target_speed * target_cos)
 
         next_state = self.model(
             state,
@@ -373,37 +420,83 @@ class AccelerationDisturbanceMPC:
 
     def los_velocity_linearization(self, state, pursuer_speed):
         state = np.asarray(state, dtype=float)
-        gradient = np.zeros((3, 8))
+        relative_position = state[0:3]
+        target_speed = state[3]
+        target_gamma = state[4]
+        target_heading = state[5]
+        pursuer_gamma = state[6]
+        pursuer_heading = state[7]
+        pursuer_speed = max(float(pursuer_speed), 1e-6)
 
-        epsilon = np.array(
+        raw_distance = np.linalg.norm(relative_position)
+        distance = max(raw_distance, 1e-6)
+        los_direction = relative_position / distance
+        projection = np.eye(3) - np.outer(los_direction, los_direction)
+
+        if raw_distance > 1e-6:
+            los_jacobian = projection / distance
+        else:
+            los_jacobian = np.eye(3) / distance
+
+        target_direction = self.direction(target_gamma, target_heading)
+        pursuer_direction = self.direction(pursuer_gamma, pursuer_heading)
+
+        target_gamma_jacobian = np.array(
             [
-                1e-3,
-                1e-3,
-                1e-3,
-                1e-3,
-                1e-6,
-                1e-6,
-                1e-6,
-                1e-6,
+                -np.sin(target_gamma) * np.cos(target_heading),
+                -np.sin(target_gamma) * np.sin(target_heading),
+                np.cos(target_gamma),
+            ]
+        )
+        target_heading_jacobian = np.array(
+            [
+                -np.cos(target_gamma) * np.sin(target_heading),
+                np.cos(target_gamma) * np.cos(target_heading),
+                0.0,
+            ]
+        )
+        pursuer_gamma_jacobian = np.array(
+            [
+                -np.sin(pursuer_gamma) * np.cos(pursuer_heading),
+                -np.sin(pursuer_gamma) * np.sin(pursuer_heading),
+                np.cos(pursuer_gamma),
+            ]
+        )
+        pursuer_heading_jacobian = np.array(
+            [
+                -np.cos(pursuer_gamma) * np.sin(pursuer_heading),
+                np.cos(pursuer_gamma) * np.cos(pursuer_heading),
+                0.0,
             ]
         )
 
-        for index in range(8):
-            state_plus = state.copy()
-            state_minus = state.copy()
-
-            state_plus[index] += epsilon[index]
-            state_minus[index] -= epsilon[index]
-
-            gradient[:, index] = (
-                self.los_velocity(state_plus, pursuer_speed)
-                - self.los_velocity(state_minus, pursuer_speed)
-            ) / (2.0 * epsilon[index])
-
-        offset = (
-            self.los_velocity(state, pursuer_speed)
-            - gradient @ state
+        relative_velocity = (
+            target_speed * target_direction
+            - pursuer_speed * pursuer_direction
         )
+        radial_velocity = np.dot(relative_velocity, los_direction)
+
+        gradient = np.zeros((3, 8))
+        gradient[:, 0:3] = -(
+            radial_velocity * np.eye(3)
+            + np.outer(los_direction, relative_velocity)
+        ) @ los_jacobian
+        gradient[:, 3] = projection @ target_direction
+        gradient[:, 4] = (
+            projection @ (target_speed * target_gamma_jacobian)
+        )
+        gradient[:, 5] = (
+            projection @ (target_speed * target_heading_jacobian)
+        )
+        gradient[:, 6] = (
+            projection @ (-pursuer_speed * pursuer_gamma_jacobian)
+        )
+        gradient[:, 7] = (
+            projection @ (-pursuer_speed * pursuer_heading_jacobian)
+        )
+
+        los_velocity = projection @ relative_velocity
+        offset = los_velocity - gradient @ state
 
         return gradient, offset
 
@@ -461,7 +554,6 @@ class AccelerationDisturbanceMPC:
             ]
         )
 
-        ## 이전 최적해를 한 스텝 앞으로 이동
         if self.U is None or self.U.shape != (self.horizon, 2):
             controls = np.zeros((self.horizon, 2))
         else:
@@ -472,7 +564,6 @@ class AccelerationDisturbanceMPC:
                 )
             )
 
-        ## 선형화 기준 궤적
         nominal_states = self.rollout(
             initial_state,
             controls,
@@ -480,7 +571,6 @@ class AccelerationDisturbanceMPC:
             disturbances,
         )
 
-        ## X = S U + T x0 + h
         S, T, h = self.prediction_matrices(
             nominal_states,
             controls,
@@ -490,7 +580,6 @@ class AccelerationDisturbanceMPC:
 
         free_states = T @ initial_state + h
 
-        ## 3차원 LOS 수직 상대속도 비용
         los_rows = np.zeros(
             (3 * self.horizon, 8 * self.horizon)
         )
@@ -513,7 +602,6 @@ class AccelerationDisturbanceMPC:
 
         los_weight = 1.0 / self.los_velocity_scale**2
 
-        ## 마지막 스텝의 상대위치 rx, ry, rz
         terminal_selector = np.zeros(
             (3, 8 * self.horizon)
         )
@@ -530,7 +618,6 @@ class AccelerationDisturbanceMPC:
             self.terminal_range_weight / initial_range**2
         )
 
-        ## U 변화량을 줄이는 비용
         variable_count = 2 * self.horizon
         difference = np.eye(variable_count)
 
@@ -544,7 +631,6 @@ class AccelerationDisturbanceMPC:
 
         control_scale_squared = self.u_max**2
 
-        ## 비용함수를 QP 형태로 정리
         hessian = (
             los_weight * los_control.T @ los_control
             + range_weight * range_control.T @ range_control
@@ -574,7 +660,6 @@ class AccelerationDisturbanceMPC:
             + 1e-9 * np.eye(variable_count)
         )
 
-        ## 두 축을 동시에 사용해도 전체 가속도가 u_max를 넘지 않게 함
         axis_limit = self.u_max / np.sqrt(2.0)
 
         solution = solve_qp(
@@ -596,7 +681,6 @@ class AccelerationDisturbanceMPC:
         return self.last_u.copy()
 
 
-# Existing code that imports ``MPC`` continues to use the original method.
 MPC = AccelerationDisturbanceMPC
 
 
