@@ -19,16 +19,14 @@ $\psi$ 는 방위각이다.
 각속도와 속도는 다음과 같이 정의된다.
 
 $$
-\begin{aligned}
-\dot{\gamma} &= \frac{a_v}{V}, \\
-\dot{\psi} &= \frac{a_s}{V\cos\gamma}, \\
-\dot{\mathbf p} &= V
+\dot{\gamma}=\frac{a_v}{V},\qquad
+\dot{\psi}=\frac{a_s}{V\cos\gamma},\qquad
+\dot{\mathbf p}=V
 \begin{bmatrix}
 \cos\gamma\cos\psi \\
 \cos\gamma\sin\psi \\
 \sin\gamma
 \end{bmatrix}.
-\end{aligned}
 $$
 
 교전은 다음 초기 조건에서 시작한다.
@@ -55,19 +53,17 @@ $2\ \mathrm{s}$). 절대 좌표를 그대로 넣으면 LSTM이 좌표 자체를 
 현재 속도 $\mathbf v_t$ 로부터 정규직교 기저를 만든다.
 
 $$
-\begin{aligned}
-\hat{\mathbf f} &= \frac{\mathbf v_t}{\lVert\mathbf v_t\rVert}, \\
-\hat{\mathbf s} &=
+\hat{\mathbf f}=\frac{\mathbf v_t}{\lVert\mathbf v_t\rVert},\qquad
+\hat{\mathbf s}=
 \frac{\hat{\mathbf z}\times\hat{\mathbf f}}
-{\lVert\hat{\mathbf z}\times\hat{\mathbf f}\rVert}, \\
-\hat{\mathbf u} &= \hat{\mathbf f}\times\hat{\mathbf s}, \\
-\mathbf R_t &=
+{\lVert\hat{\mathbf z}\times\hat{\mathbf f}\rVert},\qquad
+\hat{\mathbf u}=\hat{\mathbf f}\times\hat{\mathbf s},\qquad
+\mathbf R_t=
 \begin{bmatrix}
 \hat{\mathbf f}^{\top} \\
 \hat{\mathbf u}^{\top} \\
 \hat{\mathbf s}^{\top}
 \end{bmatrix}.
-\end{aligned}
 $$
 
 이후 $\mathbf{R}_t^\top$를 곱해 입력 데이터를 표적 기준 국소 좌표계로 정규화한다.
@@ -76,7 +72,7 @@ $$
 \mathbf X_t =
 \left[
 (\mathbf p_{t-k}-\mathbf p_t)\mathbf R_t^{\top}
-\;\middle|\;
+\;\mid\;
 \mathbf v_{t-k}\mathbf R_t^{\top}
 \right]_{k=39}^{0}
 \in \mathbb R^{40\times 6}.
@@ -126,17 +122,18 @@ $$
 이 식을 각 방식의 이차 비용함수에 대입하여 다음의 이차계획법(QP) 문제를 구성하였다.
 
 $$
-\begin{aligned}
 \underset{\mathbf U}{\operatorname{minimize}}
-\quad &
+\quad
 \frac{1}{2}\mathbf U^{\top}\mathbf P\mathbf U
-+\mathbf q^{\top}\mathbf U, \\
-\text{subject to}
-\quad &
++\mathbf q^{\top}\mathbf U.
+$$
+
+제어입력의 각 성분에는 다음 제약을 적용한다.
+
+$$
 -\frac{u_{\max}}{\sqrt{2}}
 \le u_{k,i}
 \le \frac{u_{\max}}{\sqrt{2}}.
-\end{aligned}
 $$
 
 ## 4. A 방식 — 가속도 외란 MPC
@@ -144,12 +141,18 @@ $$
 예측된 표적 가속도를 선형화된 상태방정식의 외란으로 넣는다. 예측 길이가
 MPC 지평보다 짧으므로 나머지는 0으로 채운다.
 
+예측 구간에서는 LSTM의 가속도 출력을 사용한다.
+
 $$
-\mathbf d_k =
-\begin{cases}
-\hat{\mathbf a}_{t+k}, & 0\le k<8, \\
-\mathbf 0, & 8\le k<N.
-\end{cases}
+\mathbf d_k=\hat{\mathbf a}_{t+k},
+\qquad 0\le k\lt 8.
+$$
+
+예측 구간 이후의 외란은 0으로 둔다.
+
+$$
+\mathbf d_k=\mathbf 0,
+\qquad 8\le k\lt N.
 $$
 
 $$
@@ -172,17 +175,12 @@ $$
 $$
 
 $$
-\begin{aligned}
 \underset{\mathbf U}{\operatorname{minimize}}
 \quad
-&\frac{1}{\sigma^2}
-\sum_{k=1}^{N}\lVert\mathbf v_{\perp,k}\rVert^2
-+\frac{w_r}{r_0^2}\lVert\mathbf p_{\mathrm{rel},N}\rVert^2 \\
-&+\frac{w_u}{u_{\max}^2}
-\sum_k\lVert\mathbf u_k\rVert^2
-+\frac{w_{\Delta}}{u_{\max}^2}
-\sum_k\lVert\mathbf u_k-\mathbf u_{k-1}\rVert^2.
-\end{aligned}
+\frac{1}{\sigma^2}\sum_{k=1}^{N}\lVert\mathbf v_{\perp,k}\rVert^2
++\frac{w_r}{r_0^2}\lVert\mathbf p_{\mathrm{rel},N}\rVert^2
++\frac{w_u}{u_{\max}^2}\sum_k\lVert\mathbf u_k\rVert^2
++\frac{w_{\Delta}}{u_{\max}^2}\sum_k\lVert\mathbf u_k-\mathbf u_{k-1}\rVert^2.
 $$
 
 제약은 $\lVert\mathbf u_k\rVert_\infty\le u_{\max}/\sqrt2$ 이며, 두 축을 동시에
@@ -199,13 +197,13 @@ $$
 
 $$
 j_{\mathrm{hit}}
-= \min\left\{
-j\;:\;
+= \min\left\lbrace
+j\;\mid\;
 \left\lVert
 \hat{\mathbf p}_{t+j}-\mathbf p_t^{\mathrm{int}}
 \right\rVert
 \le V_{\mathrm{int}}j\Delta t+r_{\mathrm{hit}}
-\right\}.
+\right\rbrace.
 $$
 
 실제로는 후보 인덱스를 성긴 간격에서 촘촘한 간격으로 좁혀가며 탐색하고, 각
@@ -214,20 +212,18 @@ $$
 2단계 — 조준. 단계 가중치를 그 한 인덱스에 거의 전부 몰아준다.
 
 $$
-\begin{aligned}
 \underset{\mathbf U}{\operatorname{minimize}}
 \quad
-&w_{\mathrm{hit}}
+w_{\mathrm{hit}}
 \left\lVert
 \mathbf p_{j_{\mathrm{hit}}}
 -\hat{\mathbf p}_{t+j_{\mathrm{hit}}}
-\right\rVert^2 \\
-&+w_{\mathrm{track}}
-\sum_{k<j_{\mathrm{hit}}}
+\right\rVert^2
++w_{\mathrm{track}}
+\sum_{k\lt j_{\mathrm{hit}}}
 \left\lVert\mathbf p_k-\hat{\mathbf p}_{t+k}\right\rVert^2
 +\frac{w_u}{u_{\max}^2}
 \sum_k\lVert\mathbf u_k\rVert^2.
-\end{aligned}
 $$
 
 제약은 $\lVert\mathbf u_k\rVert_\infty\le u_{\max}/\sqrt2$ 이며, 두 축을 동시에
@@ -245,3 +241,4 @@ B 방식은 긴 예측 지평에서 표적 위치를 예측하고 후보 요격 
 다만 두 방식은 LSTM 출력뿐 아니라 예측 길이, MPC 상태 구성, 비용함수 및 요격점 탐색 방식도 서로 다르다. 따라서 관측된 성능 차이를 가속도 예측 하나의 효과로만 해석할 수는 없다. 또한 PN이나 APN과 같은 고전 유도 법칙과의 비교는 수행하지 않았다.
 
 이러한 한계를 고려하더라도, 본 연구에서 평가한 조건에서는 A 방식이 더 안정적이고 계산 효율적인 유도 구조로 나타났다.
+
