@@ -239,3 +239,40 @@ B 방식은 긴 예측 지평에서 표적 위치를 예측하고 후보 요격 
 
 다만 두 방식은 LSTM 출력뿐 아니라 예측 길이, MPC 상태 구성, 비용함수 및 요격점 탐색 방식도 서로 다르다. 따라서 관측된 성능 차이를 가속도 예측 하나의 효과로만 해석할 수는 없다. 또한 PN이나 APN과 같은 고전 유도 법칙과의 비교는 수행하지 않았다.
 
+## 7. 고전 비례항법(PN) 기준선
+
+LSTM이나 MPC 없이 현재 상대위치와 상대속도만 사용하는 3차원
+비례항법(Proportional Navigation) 제어기를 `src_3d/pn.py`에 별도로 제공한다.
+기존 A/B 방식의 구현은 변경하지 않았다.
+
+상대위치와 상대속도를 각각
+$\mathbf r=\mathbf p_t-\mathbf p_m$,
+$\mathbf v_{rel}=\mathbf v_t-\mathbf v_m$로 두면 다음을 계산한다.
+
+$$
+V_c=-\mathbf v_{rel}^{\top}\hat{\mathbf r},\qquad
+\boldsymbol\omega_{LOS}=\frac{\mathbf r\times\mathbf v_{rel}}{\lVert\mathbf r\rVert^2}.
+$$
+
+3차원 true PN 가속도 명령은 다음과 같다.
+
+$$
+\mathbf a_{PN}
+=N V_c\left(\boldsymbol\omega_{LOS}\times\hat{\mathbf r}\right).
+$$
+
+세계좌표계에서 계산한 가속도를 요격체 기준 수직·측면 성분으로 투영하고,
+합성 가속도를 `max_g` 이하로 제한한다. 기본 항법상수는 $N=3$이다.
+
+프로젝트 루트에서 다음 명령으로 같은 3차원 표적 모델에 대한 PN 예제를 실행한다.
+
+```bash
+cd src_3d
+python pn_main.py --seed 103142 --plot
+```
+
+단위 테스트는 다음과 같이 실행한다.
+
+```bash
+python -m unittest discover -s tests_3d -p 'test_*.py'
+```
